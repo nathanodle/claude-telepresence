@@ -1,0 +1,29 @@
+# Compiled binaries
+claude-telepresence
+telepresence-helper
+*.o
+*.so
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# Logs
+*.log
+/tmp/
+
+# Claude local settings
+.claude/
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS
+.DS_Store

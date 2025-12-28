@@ -1,0 +1,1675 @@
+/*
+ * claude-telepresence client
+ *
+ * Thin client for legacy Unix systems (HP-UX, IRIX, NeXT, Solaris, etc.)
+ * Connects to relay server, handles terminal I/O, executes operations locally.
+ *
+ * Written in C89 for maximum portability.
+ *
+ * Build:
+ *   HP-UX:   cc -o claude-telepresence client.c -lsocket -lnsl
+ *   IRIX:    cc -o claude-telepresence client.c
+ *   Solaris: cc -o claude-telepresence client.c -lsocket -lnsl
+ *   Linux:   gcc -o claude-telepresence client.c
+ *   NeXT:    cc -o claude-telepresence client.c
+ *   AIX:     cc -o claude-telepresence client.c
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+#include <sys/ioctl.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <time.h>
+
+/* Platform-specific headers */
+/* NeXT uses sgtty instead of termios, and sys/dir.h instead of dirent.h */
+/* Modern macOS defines __APPLE__ along with __MACH__, NeXTSTEP doesn't */
+#if (defined(NeXT) || defined(__NeXT__)) || (defined(__MACH__) && !defined(__APPLE__))
+#define NEXT_COMPAT 1
+#include <libc.h>
+#include <sys/dir.h>
+#include <sgtty.h>
+#define dirent direct
+#else
+#include <sys/select.h>
+#include <termios.h>
+#include <dirent.h>
+#endif
+
+#ifdef __hpux
+#include <sys/termios.h>
+#endif
+
+/* NeXT compatibility - missing POSIX macros and functions */
+#ifdef NEXT_COMPAT
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
+#endif
+#ifndef S_ISREG
+#define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
+#endif
+#ifndef S_ISLNK
+#define S_ISLNK(m) (((m) & S_IFMT) == S_IFLNK)
+#endif
+#endif
+
+/* snprintf compatibility for old systems */
+#ifdef NEXT_COMPAT
+#include <stdarg.h>
+static int snprintf(char *buf, size_t size, const char *fmt, ...) {
+    va_list ap;
+    int ret;
+    va_start(ap, fmt);
+    ret = vsprintf(buf, fmt, ap);
+    va_end(ap);
+    return ret;
+}
+#endif
+
+#define BUFFER_SIZE (10 * 1024 * 1024)  /* 10MB buffer for large files */
+#define MAX_PATH 4096
+
+/* Global state */
+static int sockfd = -1;
+#ifdef NEXT_COMPAT
+static struct sgttyb orig_sgttyb;
+static struct tchars orig_tchars;
+static struct ltchars orig_ltchars;
+static int orig_lmode;
+#else
+static struct termios orig_termios;
+#endif
+static int raw_mode = 0;
+static int simple_mode = 0;  /* Filter fancy terminal effects */
+static FILE *logfile = NULL; /* Debug log */
+
+/* Buffers */
+static char *recv_buffer = NULL;
+static char *send_buffer = NULL;
+static char *json_buffer = NULL;
+static char *result_buffer = NULL;
+
+/* Signal handling */
+static volatile sig_atomic_t got_sigwinch = 0;
+
+static void sigwinch_handler(int sig) {
+    (void)sig;
+    got_sigwinch = 1;
+}
+
+/* ============================================================================
+ * Terminal handling
+ * ============================================================================ */
+
+#ifdef NEXT_COMPAT
+static void disable_raw_mode(void) {
+    if (raw_mode) {
+        ioctl(STDIN_FILENO, TIOCSETP, &orig_sgttyb);
+        ioctl(STDIN_FILENO, TIOCSETC, &orig_tchars);
+        ioctl(STDIN_FILENO, TIOCSLTC, &orig_ltchars);
+        ioctl(STDIN_FILENO, TIOCLSET, &orig_lmode);
+        raw_mode = 0;
+    }
+}
+
+static void enable_raw_mode(void) {
+    struct sgttyb raw_sgttyb;
+    struct tchars raw_tchars;
+    struct ltchars raw_ltchars;
+    int lmode;
+
+    if (ioctl(STDIN_FILENO, TIOCGETP, &orig_sgttyb) < 0) return;
+    if (ioctl(STDIN_FILENO, TIOCGETC, &orig_tchars) < 0) return;
+    if (ioctl(STDIN_FILENO, TIOCGLTC, &orig_ltchars) < 0) return;
+    if (ioctl(STDIN_FILENO, TIOCLGET, &orig_lmode) < 0) return;
+
+    raw_sgttyb = orig_sgttyb;
+    raw_sgttyb.sg_flags |= RAW;
+    raw_sgttyb.sg_flags &= ~ECHO;
+
+    /* Disable special characters */
+    memset(&raw_tchars, -1, sizeof(raw_tchars));
+    memset(&raw_ltchars, -1, sizeof(raw_ltchars));
+    lmode = orig_lmode;
+
+    if (ioctl(STDIN_FILENO, TIOCSETP, &raw_sgttyb) < 0) return;
+    ioctl(STDIN_FILENO, TIOCSETC, &raw_tchars);
+    ioctl(STDIN_FILENO, TIOCSLTC, &raw_ltchars);
+    ioctl(STDIN_FILENO, TIOCLSET, &lmode);
+
+    raw_mode = 1;
+    atexit(disable_raw_mode);
+}
+#else
+static void disable_raw_mode(void) {
+    if (raw_mode) {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
+        raw_mode = 0;
+    }
+}
+
+static void enable_raw_mode(void) {
+    struct termios raw;
+
+    if (tcgetattr(STDIN_FILENO, &orig_termios) == -1) return;
+
+    raw = orig_termios;
+    raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+    raw.c_oflag &= ~(OPOST);
+    raw.c_cflag |= (CS8);
+    raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 1;
+
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) return;
+
+    raw_mode = 1;
+    atexit(disable_raw_mode);
+}
+#endif
+
+static void get_terminal_size(int *rows, int *cols) {
+#ifdef TIOCGWINSZ
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
+        *rows = ws.ws_row;
+        *cols = ws.ws_col;
+        return;
+    }
+#endif
+    *rows = 24;
+    *cols = 80;
+}
+
+/* Spinner state for animated -\|/ */
+static int spinner_state = 0;
+static const char spinner_chars[] = "-\\|/";
+
+/* Filter for simple mode: convert Unicode to ASCII and strip color codes */
+static size_t filter_terminal_output(const char *in, char *out, size_t outlen) {
+    const unsigned char *p = (const unsigned char *)in;
+    size_t inlen = strlen(in);
+    size_t j = 0;
+    size_t i = 0;
+    unsigned char c, ch, cmd;
+    size_t start;
+    int looks_like_sgr, has_question;
+
+    while (i < inlen && j < outlen - 1) {
+        c = p[i];
+
+        /* Handle ESC sequences - strip colors, keep everything else */
+        if (c == 0x1b && (i + 1) < inlen && p[i + 1] == '[') {
+            /* CSI sequence: ESC [ params command */
+            start = i;
+            i += 2;  /* skip ESC [ */
+
+            /* Check if this looks like SGR (color) - only digits, semicolons, and 'm' */
+            looks_like_sgr = 1;
+            has_question = 0;
+
+            /* Scan for command letter */
+            while (i < inlen && p[i] >= 0x20 && p[i] < 0x40) {
+                ch = p[i];
+                /* SGR uses digits, semicolons, and colons (for extended color syntax) */
+                /* If we see ? or other chars, it's not SGR */
+                if (ch == '?') has_question = 1;
+                if (ch != ';' && ch != ':' && (ch < '0' || ch > '9')) {
+                    looks_like_sgr = 0;
+                }
+                i++;
+            }
+
+            if (i >= inlen) {
+                /* Incomplete sequence at end */
+                if (looks_like_sgr && !has_question) {
+                    /* Probably a color code - discard */
+                    break;
+                }
+                /* Otherwise pass through */
+                while (start < inlen && j < outlen - 1) {
+                    out[j++] = p[start++];
+                }
+                break;
+            }
+
+            cmd = p[i++];
+
+            /* Strip SGR (color/formatting) which ends with 'm' */
+            if (cmd == 'm') {
+                /* Skip - don't copy */
+            } else {
+                /* Copy the whole sequence */
+                while (start < i && j < outlen - 1) {
+                    out[j++] = p[start++];
+                }
+            }
+            continue;
+        }
+
+        /* Pass through other ASCII */
+        if (c < 0x80) {
+            out[j++] = c;
+            i++;
+            continue;
+        }
+
+        /* Handle UTF-8 sequences - convert known ones to ASCII */
+
+        /* 3-byte UTF-8: E2 xx xx - includes box drawing, arrows, symbols */
+        if (c == 0xE2 && (i + 2) < inlen) {
+            unsigned char b1 = p[i + 1];
+            unsigned char b2 = p[i + 2];
+
+            /* Box drawing U+2500-U+257F (E2 94 80 - E2 95 BF) */
+            if (b1 == 0x94) {
+                /* Light box drawing */
+                if (b2 >= 0x80 && b2 <= 0x84) out[j++] = '-';      /* horizontal lines */
+                else if (b2 >= 0x82 && b2 <= 0x83) out[j++] = '|'; /* vertical lines */
+                else out[j++] = '+';                               /* corners, etc */
+                i += 3;
+                continue;
+            }
+            if (b1 == 0x95) {
+                /* Heavy/double box drawing */
+                if (b2 >= 0x90 && b2 <= 0x94) out[j++] = '=';      /* double horizontal */
+                else if (b2 >= 0x91 && b2 <= 0x93) out[j++] = '|'; /* double vertical */
+                /* Rounded corners E2 95 AD-B0 */
+                else out[j++] = '+';
+                i += 3;
+                continue;
+            }
+
+            /* Arrows U+2190-U+21FF (E2 86 xx) */
+            if (b1 == 0x86) {
+                if (b2 == 0x90) out[j++] = '<';       /* ← leftwards arrow */
+                else if (b2 == 0x91) out[j++] = '^';  /* ↑ upwards arrow */
+                else if (b2 == 0x92) out[j++] = '>';  /* → rightwards arrow */
+                else if (b2 == 0x93) out[j++] = 'v';  /* ↓ downwards arrow */
+                else out[j++] = '>';                  /* other arrows default to > */
+                i += 3;
+                continue;
+            }
+
+            /* Geometric shapes U+25A0-U+25FF (E2 96 xx, E2 97 xx) */
+            if (b1 == 0x96) {
+                if (b2 == 0xB2) out[j++] = '^';       /* ▲ up triangle */
+                else if (b2 == 0xB3) out[j++] = '^';  /* △ white up triangle */
+                else if (b2 == 0xB4) out[j++] = '>';  /* ▴ small up triangle */
+                else if (b2 == 0xB5) out[j++] = '>';  /* ▵ small white up triangle */
+                else if (b2 == 0xB6) out[j++] = '>';  /* ▶ right triangle */
+                else if (b2 == 0xB7) out[j++] = '>';  /* ▷ white right triangle */
+                else if (b2 == 0xB8) out[j++] = '>';  /* ▸ small right triangle */
+                else if (b2 == 0xB9) out[j++] = '>';  /* ▹ small white right triangle */
+                else if (b2 == 0xBA) out[j++] = 'v';  /* ► small down triangle */
+                else if (b2 == 0xBB) out[j++] = 'v';  /* ▻ small white down triangle */
+                else if (b2 == 0xBC) out[j++] = 'v';  /* ▼ down triangle */
+                else if (b2 == 0xBD) out[j++] = 'v';  /* ▽ white down triangle */
+                else out[j++] = '*';                  /* other shapes */
+                i += 3;
+                continue;
+            }
+            if (b1 == 0x97) {
+                if (b2 == 0x80) out[j++] = '<';       /* ◀ left triangle */
+                else if (b2 == 0x81) out[j++] = '<';  /* ◁ white left triangle */
+                else if (b2 == 0x82) out[j++] = '<';  /* ◂ small left triangle */
+                else if (b2 == 0x83) out[j++] = '<';  /* ◃ small white left triangle */
+                else if (b2 == 0x8F) {               /* ● bullet - use as spinner */
+                    out[j++] = spinner_chars[spinner_state];
+                    spinner_state = (spinner_state + 1) & 3;
+                }
+                else if (b2 == 0x8B) out[j++] = 'o';  /* ○ white circle */
+                else if (b2 == 0x86 || b2 == 0x87) out[j++] = '*'; /* ◆◇ diamonds */
+                else out[j++] = '*';                  /* other shapes */
+                i += 3;
+                continue;
+            }
+
+            /* Dingbats - checkmarks, X marks, stars U+2700-U+27BF (E2 9C xx, E2 9D xx) */
+            if (b1 == 0x9C) {
+                /* Checkmarks: ✓ U+2713 (E2 9C 93), ✔ U+2714 (E2 9C 94) */
+                if (b2 == 0x93 || b2 == 0x94) {
+                    out[j++] = '+';
+                    i += 3;
+                    continue;
+                }
+                /* X marks: ✗ U+2717 (E2 9C 97), ✘ U+2718 (E2 9C 98) */
+                if (b2 == 0x97 || b2 == 0x98) {
+                    out[j++] = 'x';
+                    i += 3;
+                    continue;
+                }
+                /* Spinner stars/asterisks - animate! */
+                /* ✢ U+2722 (E2 9C A2), ✳ U+2733 (E2 9C B3), ✶ U+2736 (E2 9C B6) */
+                /* ✻ U+273B (E2 9C BB), ✽ U+273D (E2 9C BD) */
+                if (b2 == 0xA2 || b2 == 0xB3 || b2 == 0xB6 ||
+                    b2 == 0xBB || b2 == 0xBD) {
+                    out[j++] = spinner_chars[spinner_state];
+                    spinner_state = (spinner_state + 1) & 3;
+                    i += 3;
+                    continue;
+                }
+                /* ✅ U+2705 (E2 9C 85) - green checkmark emoji */
+                if (b2 == 0x85) {
+                    out[j++] = '+';
+                    i += 3;
+                    continue;
+                }
+                /* Other dingbats */
+                out[j++] = '*';
+                i += 3;
+                continue;
+            }
+            if (b1 == 0x9D) {
+                /* ❌ U+274C (E2 9D 8C) - red X emoji */
+                if (b2 == 0x8C) {
+                    out[j++] = 'x';
+                    i += 3;
+                    continue;
+                }
+                out[j++] = '*';
+                i += 3;
+                continue;
+            }
+
+            /* Heavy arrows/dingbats U+2780-U+27BF (E2 9E xx) */
+            if (b1 == 0x9E) {
+                /* Most are arrow variants - map to > */
+                /* ➔ U+2794, ➜ U+279C, ➤ U+27A4, etc. */
+                out[j++] = '>';
+                i += 3;
+                continue;
+            }
+
+            /* Mathematical operators U+2200-U+22FF (E2 88 xx) */
+            if (b1 == 0x88) {
+                /* ∴ U+2234 (E2 88 B4) - therefore, used as thinking indicator */
+                if (b2 == 0xB4) {
+                    out[j++] = spinner_chars[spinner_state];
+                    spinner_state = (spinner_state + 1) & 3;
+                    i += 3;
+                    continue;
+                }
+                out[j++] = '*';
+                i += 3;
+                continue;
+            }
+
+            /* Miscellaneous Technical U+2300-U+23FF (E2 8C xx, E2 8D xx, E2 8E xx, E2 8F xx) */
+            if (b1 >= 0x8C && b1 <= 0x8F) {
+                /* Various technical symbols */
+                /* ⎿ U+23BF (E2 8E BF) - used as bye/wave icon */
+                out[j++] = '>';
+                i += 3;
+                continue;
+            }
+
+            /* General punctuation U+2000-U+206F (E2 80 xx) */
+            if (b1 == 0x80) {
+                if (b2 == 0xA2) out[j++] = '*';       /* • bullet */
+                else if (b2 == 0xA3) out[j++] = '>';  /* ‣ triangular bullet */
+                else if (b2 >= 0x93 && b2 <= 0x95) out[j++] = '-'; /* dashes */
+                else if (b2 == 0x98 || b2 == 0x99) out[j++] = '\''; /* ' ' quotes */
+                else if (b2 == 0x9C || b2 == 0x9D) out[j++] = '"';  /* " " quotes */
+                else if (b2 == 0xA6) out[j++] = '.';  /* … ellipsis -> . */
+                else if (b2 == 0xB9) out[j++] = '<';  /* ‹ single angle quote */
+                else if (b2 == 0xBA) out[j++] = '>';  /* › single angle quote */
+                else out[j++] = ' ';
+                i += 3;
+                continue;
+            }
+
+            /* Unknown 3-byte E2 sequence */
+            out[j++] = '?';
+            i += 3;
+            continue;
+        }
+
+        /* 2-byte UTF-8: C2/C3 xx */
+        if ((c == 0xC2 || c == 0xC3) && (i + 1) < inlen) {
+            unsigned char b1 = p[i + 1];
+            if (c == 0xC2 && b1 == 0xA0) {
+                out[j++] = ' ';  /* NBSP */
+            } else if (c == 0xC2 && b1 == 0xB7) {
+                /* · middle dot U+00B7 - use as spinner */
+                out[j++] = spinner_chars[spinner_state];
+                spinner_state = (spinner_state + 1) & 3;
+            } else {
+                /* Other Latin-1 supplement - try to pass through or use ? */
+                out[j++] = '?';
+            }
+            i += 2;
+            continue;
+        }
+
+        /* 4-byte UTF-8: F0 xx xx xx - includes emoji */
+        if (c == 0xF0 && (i + 3) < inlen) {
+            unsigned char b1 = p[i + 1];
+            /* Most emoji are in F0 9F xx xx range */
+            if (b1 == 0x9F) {
+                /* Common emoji mappings */
+                /* 🤖 robot F0 9F A4 96 */
+                /* Just use a generic placeholder for now */
+                out[j++] = '*';
+            } else {
+                out[j++] = '?';
+            }
+            i += 4;
+            continue;
+        }
+
+        /* Other multi-byte UTF-8 - skip with placeholder */
+        if ((c & 0xE0) == 0xC0) { out[j++] = '?'; i += 2; continue; }
+        if ((c & 0xF0) == 0xE0) { out[j++] = '?'; i += 3; continue; }
+        if ((c & 0xF8) == 0xF0) { out[j++] = '?'; i += 4; continue; }
+
+        /* Shouldn't get here, but skip byte */
+        i++;
+    }
+
+    out[j] = '\0';
+    return j;
+}
+
+/* ============================================================================
+ * Simple JSON helpers (no external dependencies)
+ * ============================================================================ */
+
+static void json_escape_string(const char *in, char *out, size_t outlen) {
+    size_t i = 0;
+    out[i++] = '"';
+    while (*in && i < outlen - 2) {
+        unsigned char c = (unsigned char)*in;
+        if (c == '"') {
+            if (i + 2 >= outlen - 1) break;
+            out[i++] = '\\'; out[i++] = '"';
+        } else if (c == '\\') {
+            if (i + 2 >= outlen - 1) break;
+            out[i++] = '\\'; out[i++] = '\\';
+        } else if (c == '\n') {
+            if (i + 2 >= outlen - 1) break;
+            out[i++] = '\\'; out[i++] = 'n';
+        } else if (c == '\r') {
+            if (i + 2 >= outlen - 1) break;
+            out[i++] = '\\'; out[i++] = 'r';
+        } else if (c == '\t') {
+            if (i + 2 >= outlen - 1) break;
+            out[i++] = '\\'; out[i++] = 't';
+        } else if (c < 32) {
+            /* Encode other control characters as \uXXXX */
+            if (i + 6 >= outlen - 1) break;
+            out[i++] = '\\';
+            out[i++] = 'u';
+            out[i++] = '0';
+            out[i++] = '0';
+            out[i++] = "0123456789abcdef"[(c >> 4) & 0xf];
+            out[i++] = "0123456789abcdef"[c & 0xf];
+        } else {
+            out[i++] = c;
+        }
+        in++;
+    }
+    out[i++] = '"';
+    out[i] = '\0';
+}
+
+static char *json_get_string(const char *json, const char *key, char *out, size_t outlen) {
+    char search[256];
+    char *start, *end;
+    size_t len;
+
+    snprintf(search, sizeof(search), "\"%s\":", key);
+    start = strstr(json, search);
+    if (!start) {
+        out[0] = '\0';
+        return out;
+    }
+
+    start += strlen(search);
+    while (*start == ' ' || *start == '\t') start++;
+
+    if (*start == '"') {
+        start++;
+        end = start;
+        while (*end && !(*end == '"' && *(end-1) != '\\')) end++;
+        len = end - start;
+        if (len >= outlen) len = outlen - 1;
+        memcpy(out, start, len);
+        out[len] = '\0';
+
+        /* Unescape */
+        {
+            char *r = out, *w = out;
+            while (*r) {
+                if (*r == '\\' && *(r+1)) {
+                    r++;
+                    switch (*r) {
+                        case 'n': *w++ = '\n'; r++; break;
+                        case 'r': *w++ = '\r'; r++; break;
+                        case 't': *w++ = '\t'; r++; break;
+                        case '"': *w++ = '"'; r++; break;
+                        case '\\': *w++ = '\\'; r++; break;
+                        case 'u':
+                            /* Unicode escape \uXXXX */
+                            if (r[1] && r[2] && r[3] && r[4]) {
+                                char hex[5] = {r[1], r[2], r[3], r[4], 0};
+                                unsigned int codepoint = (unsigned int)strtoul(hex, NULL, 16);
+                                if (codepoint < 0x80) {
+                                    *w++ = (char)codepoint;
+                                } else if (codepoint < 0x800) {
+                                    *w++ = (char)(0xC0 | (codepoint >> 6));
+                                    *w++ = (char)(0x80 | (codepoint & 0x3F));
+                                } else {
+                                    *w++ = (char)(0xE0 | (codepoint >> 12));
+                                    *w++ = (char)(0x80 | ((codepoint >> 6) & 0x3F));
+                                    *w++ = (char)(0x80 | (codepoint & 0x3F));
+                                }
+                                r += 5;
+                            } else {
+                                *w++ = *r++;
+                            }
+                            break;
+                        default: *w++ = *r++;
+                    }
+                } else {
+                    *w++ = *r++;
+                }
+            }
+            *w = '\0';
+        }
+    } else {
+        out[0] = '\0';
+    }
+    return out;
+}
+
+static long json_get_int(const char *json, const char *key) {
+    char search[256];
+    char *start;
+
+    snprintf(search, sizeof(search), "\"%s\":", key);
+    start = strstr(json, search);
+    if (!start) return -1;
+
+    start += strlen(search);
+    while (*start == ' ' || *start == '\t') start++;
+
+    return atol(start);
+}
+
+static int json_get_bool(const char *json, const char *key) {
+    char search[256];
+    char *start;
+
+    snprintf(search, sizeof(search), "\"%s\":", key);
+    start = strstr(json, search);
+    if (!start) return 0;
+
+    start += strlen(search);
+    while (*start == ' ' || *start == '\t') start++;
+
+    return (strncmp(start, "true", 4) == 0);
+}
+
+/* ============================================================================
+ * Network functions
+ * ============================================================================ */
+
+static int connect_to_relay(const char *host, int port) {
+    struct hostent *server;
+    struct sockaddr_in serv_addr;
+    unsigned long addr;
+
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        perror("socket");
+        return -1;
+    }
+
+    memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(port);
+
+    /* Try numeric IP first (old gethostbyname doesn't handle IPs) */
+    addr = inet_addr(host);
+    if (addr != (unsigned long)-1) {
+        serv_addr.sin_addr.s_addr = addr;
+    } else {
+        /* Fall back to hostname lookup */
+        server = gethostbyname(host);
+        if (!server) {
+            fprintf(stderr, "Cannot resolve host: %s\n", host);
+            close(sockfd);
+            return -1;
+        }
+        memcpy(&serv_addr.sin_addr.s_addr, server->h_addr, server->h_length);
+    }
+
+    if (connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        perror("connect");
+        close(sockfd);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int send_message(const char *json) {
+    size_t len = strlen(json);
+    unsigned char header[4];
+    size_t sent;
+
+    /* Big-endian length header */
+    header[0] = (len >> 24) & 0xFF;
+    header[1] = (len >> 16) & 0xFF;
+    header[2] = (len >> 8) & 0xFF;
+    header[3] = len & 0xFF;
+
+    if (write(sockfd, header, 4) != 4) return -1;
+
+    sent = 0;
+    while (sent < len) {
+        int n = write(sockfd, json + sent, len - sent);
+        if (n <= 0) return -1;
+        sent += n;
+    }
+
+    return 0;
+}
+
+static int recv_message(char *buf, size_t buflen) {
+    unsigned char header[4];
+    size_t len, received;
+
+    /* Read length header */
+    if (read(sockfd, header, 4) != 4) return -1;
+
+    len = ((size_t)header[0] << 24) | ((size_t)header[1] << 16) |
+          ((size_t)header[2] << 8) | (size_t)header[3];
+
+    if (len >= buflen) {
+        fprintf(stderr, "Message too large: %lu\n", (unsigned long)len);
+        return -1;
+    }
+
+    received = 0;
+    while (received < len) {
+        int n = read(sockfd, buf + received, len - received);
+        if (n <= 0) return -1;
+        received += n;
+    }
+    buf[len] = '\0';
+
+    return (int)len;
+}
+
+/* ============================================================================
+ * Operation handlers
+ * ============================================================================ */
+
+static void handle_fs_readFile(const char *params, char *response, size_t resplen) {
+    char path[MAX_PATH];
+    FILE *fp;
+    size_t file_len;
+    char *content;
+    char *encoded;
+    size_t enc_len;
+
+    json_get_string(params, "path", path, sizeof(path));
+
+    fp = fopen(path, "rb");
+    if (!fp) {
+        snprintf(response, resplen, "{\"error\":\"%s\",\"code\":\"ENOENT\"}", strerror(errno));
+        return;
+    }
+
+    fseek(fp, 0, SEEK_END);
+    file_len = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+
+    content = malloc(file_len + 1);
+    if (!content) {
+        fclose(fp);
+        snprintf(response, resplen, "{\"error\":\"Out of memory\"}");
+        return;
+    }
+
+    fread(content, 1, file_len, fp);
+    content[file_len] = '\0';
+    fclose(fp);
+
+    /* Base64 encode */
+    enc_len = ((file_len + 2) / 3) * 4 + 1;
+    encoded = malloc(enc_len);
+    if (!encoded) {
+        free(content);
+        snprintf(response, resplen, "{\"error\":\"Out of memory\"}");
+        return;
+    }
+
+    {
+        static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        size_t i, j = 0;
+        for (i = 0; i < file_len; i += 3) {
+            unsigned int n = ((unsigned char)content[i]) << 16;
+            if (i + 1 < file_len) n |= ((unsigned char)content[i+1]) << 8;
+            if (i + 2 < file_len) n |= ((unsigned char)content[i+2]);
+
+            encoded[j++] = b64[(n >> 18) & 63];
+            encoded[j++] = b64[(n >> 12) & 63];
+            encoded[j++] = (i + 1 < file_len) ? b64[(n >> 6) & 63] : '=';
+            encoded[j++] = (i + 2 < file_len) ? b64[n & 63] : '=';
+        }
+        encoded[j] = '\0';
+    }
+
+    snprintf(response, resplen, "{\"result\":\"%s\"}", encoded);
+
+    free(content);
+    free(encoded);
+}
+
+static void handle_fs_writeFile(const char *params, char *response, size_t resplen) {
+    char path[MAX_PATH];
+    char *data;
+    char *decoded;
+    size_t data_len, dec_len;
+    int is_buffer;
+    FILE *fp;
+
+    json_get_string(params, "path", path, sizeof(path));
+    is_buffer = json_get_bool(params, "isBuffer");
+
+    data = malloc(BUFFER_SIZE);
+    if (!data) {
+        snprintf(response, resplen, "{\"error\":\"Out of memory\"}");
+        return;
+    }
+    json_get_string(params, "data", data, BUFFER_SIZE);
+
+    if (is_buffer) {
+        /* Base64 decode */
+        data_len = strlen(data);
+        dec_len = (data_len / 4) * 3;
+        decoded = malloc(dec_len + 1);
+        if (!decoded) {
+            free(data);
+            snprintf(response, resplen, "{\"error\":\"Out of memory\"}");
+            return;
+        }
+
+        {
+            static const int d[] = {
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
+                -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+                -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1
+            };
+            size_t i, j = 0;
+            for (i = 0; i < data_len; i += 4) {
+                int a = d[(unsigned char)data[i]];
+                int b = d[(unsigned char)data[i+1]];
+                int c = d[(unsigned char)data[i+2]];
+                int e = d[(unsigned char)data[i+3]];
+                if (a < 0 || b < 0) break;
+                decoded[j++] = (a << 2) | (b >> 4);
+                if (c >= 0) decoded[j++] = ((b & 15) << 4) | (c >> 2);
+                if (e >= 0) decoded[j++] = ((c & 3) << 6) | e;
+            }
+            dec_len = j;
+        }
+
+        fp = fopen(path, "wb");
+        if (!fp) {
+            free(data);
+            free(decoded);
+            snprintf(response, resplen, "{\"error\":\"%s\",\"code\":\"ENOENT\"}", strerror(errno));
+            return;
+        }
+        fwrite(decoded, 1, dec_len, fp);
+        fclose(fp);
+        free(decoded);
+    } else {
+        fp = fopen(path, "w");
+        if (!fp) {
+            free(data);
+            snprintf(response, resplen, "{\"error\":\"%s\",\"code\":\"ENOENT\"}", strerror(errno));
+            return;
+        }
+        fputs(data, fp);
+        fclose(fp);
+    }
+
+    free(data);
+    snprintf(response, resplen, "{\"result\":true}");
+}
+
+static void handle_fs_stat(const char *params, char *response, size_t resplen) {
+    char path[MAX_PATH];
+    struct stat st;
+
+    json_get_string(params, "path", path, sizeof(path));
+
+    if (stat(path, &st) < 0) {
+        snprintf(response, resplen, "{\"error\":\"%s\",\"code\":\"ENOENT\"}", strerror(errno));
+        return;
+    }
+
+    snprintf(response, resplen,
+        "{\"result\":{"
+        "\"dev\":%lu,\"ino\":%lu,\"mode\":%u,\"nlink\":%lu,"
+        "\"uid\":%u,\"gid\":%u,\"rdev\":%lu,\"size\":%lu,"
+        "\"blksize\":%lu,\"blocks\":%lu,"
+        "\"atimeMs\":%lu,\"mtimeMs\":%lu,\"ctimeMs\":%lu,\"birthtimeMs\":%lu,"
+        "\"isFile\":%s,\"isDirectory\":%s,\"isSymbolicLink\":false"
+        "}}",
+        (unsigned long)st.st_dev, (unsigned long)st.st_ino, (unsigned)st.st_mode,
+        (unsigned long)st.st_nlink, (unsigned)st.st_uid, (unsigned)st.st_gid,
+        (unsigned long)st.st_rdev, (unsigned long)st.st_size,
+        (unsigned long)st.st_blksize, (unsigned long)st.st_blocks,
+        (unsigned long)st.st_atime * 1000, (unsigned long)st.st_mtime * 1000,
+        (unsigned long)st.st_ctime * 1000, (unsigned long)st.st_ctime * 1000,
+        S_ISREG(st.st_mode) ? "true" : "false",
+        S_ISDIR(st.st_mode) ? "true" : "false"
+    );
+}
+
+static void handle_fs_lstat(const char *params, char *response, size_t resplen) {
+    char path[MAX_PATH];
+    struct stat st;
+
+    json_get_string(params, "path", path, sizeof(path));
+
+    if (lstat(path, &st) < 0) {
+        snprintf(response, resplen, "{\"error\":\"%s\",\"code\":\"ENOENT\"}", strerror(errno));
+        return;
+    }
+
+    snprintf(response, resplen,
+        "{\"result\":{"
+        "\"dev\":%lu,\"ino\":%lu,\"mode\":%u,\"nlink\":%lu,"
+        "\"uid\":%u,\"gid\":%u,\"rdev\":%lu,\"size\":%lu,"
+        "\"blksize\":%lu,\"blocks\":%lu,"
+        "\"atimeMs\":%lu,\"mtimeMs\":%lu,\"ctimeMs\":%lu,\"birthtimeMs\":%lu,"
+        "\"isFile\":%s,\"isDirectory\":%s,\"isSymbolicLink\":%s"
+        "}}",
+        (unsigned long)st.st_dev, (unsigned long)st.st_ino, (unsigned)st.st_mode,
+        (unsigned long)st.st_nlink, (unsigned)st.st_uid, (unsigned)st.st_gid,
+        (unsigned long)st.st_rdev, (unsigned long)st.st_size,
+        (unsigned long)st.st_blksize, (unsigned long)st.st_blocks,
+        (unsigned long)st.st_atime * 1000, (unsigned long)st.st_mtime * 1000,
+        (unsigned long)st.st_ctime * 1000, (unsigned long)st.st_ctime * 1000,
+        S_ISREG(st.st_mode) ? "true" : "false",
+        S_ISDIR(st.st_mode) ? "true" : "false",
+        S_ISLNK(st.st_mode) ? "true" : "false"
+    );
+}
+
+static void handle_fs_readdir(const char *params, char *response, size_t resplen) {
+    char path[MAX_PATH];
+    DIR *dir;
+    struct dirent *ent;
+    size_t pos;
+    int first = 1;
+
+    json_get_string(params, "path", path, sizeof(path));
+
+    dir = opendir(path);
+    if (!dir) {
+        snprintf(response, resplen, "{\"error\":\"%s\",\"code\":\"ENOENT\"}", strerror(errno));
+        return;
+    }
+
+    pos = snprintf(response, resplen, "{\"result\":[");
+
+    while ((ent = readdir(dir)) != NULL) {
+        char escaped_name[1024];
+        char full_path[MAX_PATH];
+        struct stat st;
+
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+            continue;
+
+        json_escape_string(ent->d_name, escaped_name, sizeof(escaped_name));
+
+        snprintf(full_path, sizeof(full_path), "%s/%s", path, ent->d_name);
+
+        if (pos + 256 >= resplen) break;
+
+        if (!first) response[pos++] = ',';
+        first = 0;
+
+        if (stat(full_path, &st) == 0) {
+            pos += snprintf(response + pos, resplen - pos,
+                "{\"name\":%s,\"isFile\":%s,\"isDirectory\":%s}",
+                escaped_name,
+                S_ISREG(st.st_mode) ? "true" : "false",
+                S_ISDIR(st.st_mode) ? "true" : "false"
+            );
+        } else {
+            pos += snprintf(response + pos, resplen - pos, "%s", escaped_name);
+        }
+    }
+
+    closedir(dir);
+    snprintf(response + pos, resplen - pos, "]}");
+}
+
+static void handle_fs_exists(const char *params, char *response, size_t resplen) {
+    char path[MAX_PATH];
+    struct stat st;
+
+    json_get_string(params, "path", path, sizeof(path));
+
+    if (stat(path, &st) == 0) {
+        snprintf(response, resplen, "{\"result\":true}");
+    } else {
+        snprintf(response, resplen, "{\"result\":false}");
+    }
+}
+
+static void handle_fs_mkdir(const char *params, char *response, size_t resplen) {
+    char path[MAX_PATH];
+
+    json_get_string(params, "path", path, sizeof(path));
+
+    if (mkdir(path, 0755) < 0 && errno != EEXIST) {
+        snprintf(response, resplen, "{\"error\":\"%s\"}", strerror(errno));
+        return;
+    }
+
+    snprintf(response, resplen, "{\"result\":true}");
+}
+
+static void handle_fs_unlink(const char *params, char *response, size_t resplen) {
+    char path[MAX_PATH];
+
+    json_get_string(params, "path", path, sizeof(path));
+
+    if (unlink(path) < 0) {
+        snprintf(response, resplen, "{\"error\":\"%s\"}", strerror(errno));
+        return;
+    }
+
+    snprintf(response, resplen, "{\"result\":true}");
+}
+
+static void handle_fs_rename(const char *params, char *response, size_t resplen) {
+    char old_path[MAX_PATH], new_path[MAX_PATH];
+
+    json_get_string(params, "oldPath", old_path, sizeof(old_path));
+    json_get_string(params, "newPath", new_path, sizeof(new_path));
+
+    if (rename(old_path, new_path) < 0) {
+        snprintf(response, resplen, "{\"error\":\"%s\"}", strerror(errno));
+        return;
+    }
+
+    snprintf(response, resplen, "{\"result\":true}");
+}
+
+static void handle_fs_access(const char *params, char *response, size_t resplen) {
+    char path[MAX_PATH];
+    int mode;
+
+    json_get_string(params, "path", path, sizeof(path));
+    mode = (int)json_get_int(params, "mode");
+    if (mode < 0) mode = F_OK;
+
+    if (access(path, mode) < 0) {
+        snprintf(response, resplen, "{\"error\":\"%s\",\"code\":\"ENOENT\"}", strerror(errno));
+        return;
+    }
+
+    snprintf(response, resplen, "{\"result\":true}");
+}
+
+static void handle_fs_realpath(const char *params, char *response, size_t resplen) {
+    char path[MAX_PATH];
+    char resolved[MAX_PATH];
+    char escaped[MAX_PATH * 2];
+
+    json_get_string(params, "path", path, sizeof(path));
+
+    if (!realpath(path, resolved)) {
+        snprintf(response, resplen, "{\"error\":\"%s\"}", strerror(errno));
+        return;
+    }
+
+    json_escape_string(resolved, escaped, sizeof(escaped));
+    snprintf(response, resplen, "{\"result\":%s}", escaped);
+}
+
+/* ============================================================================
+ * Native find and search implementations
+ * ============================================================================ */
+
+/* Simple wildcard pattern matcher (supports * and ?) */
+static int match_pattern(const char *pattern, const char *str) {
+    while (*pattern && *str) {
+        if (*pattern == '*') {
+            pattern++;
+            if (!*pattern) return 1;  /* trailing * matches all */
+            while (*str) {
+                if (match_pattern(pattern, str)) return 1;
+                str++;
+            }
+            return 0;
+        } else if (*pattern == '?' || *pattern == *str) {
+            pattern++;
+            str++;
+        } else {
+            return 0;
+        }
+    }
+    /* Handle trailing * */
+    while (*pattern == '*') pattern++;
+    return (*pattern == '\0' && *str == '\0');
+}
+
+/* Recursive find helper - appends matches to result buffer */
+static void find_recursive(const char *dir_path, const char *pattern,
+                          char *result, size_t *pos, size_t maxlen, int *count, int max_results,
+                          int depth) {
+    DIR *dir;
+    struct dirent *ent;
+    char full_path[MAX_PATH];
+    struct stat st;
+    char escaped[MAX_PATH * 2];
+
+    /* Limit recursion depth to prevent stack overflow */
+    if (depth > 64) return;
+    if (*count >= max_results) return;
+
+    dir = opendir(dir_path);
+    if (!dir) return;
+
+    while ((ent = readdir(dir)) != NULL && *count < max_results) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+            continue;
+
+        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, ent->d_name);
+
+        /* Use lstat to NOT follow symlinks - prevents infinite loops */
+        if (lstat(full_path, &st) < 0) continue;
+
+        /* Skip symlinks entirely to avoid loops */
+        if (S_ISLNK(st.st_mode)) continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            /* Recurse into subdirectory */
+            find_recursive(full_path, pattern, result, pos, maxlen, count, max_results, depth + 1);
+        } else if (S_ISREG(st.st_mode)) {
+            /* Check if filename matches pattern */
+            if (match_pattern(pattern, ent->d_name)) {
+                json_escape_string(full_path, escaped, sizeof(escaped));
+                if (*pos + strlen(escaped) + 2 < maxlen) {
+                    if (*count > 0) result[(*pos)++] = ',';
+                    *pos += snprintf(result + *pos, maxlen - *pos, "%s", escaped);
+                    (*count)++;
+                }
+            }
+        }
+    }
+
+    closedir(dir);
+}
+
+static void handle_fs_find(const char *params, char *response, size_t resplen) {
+    char path[MAX_PATH];
+    char pattern[256];
+    size_t pos;
+    int count = 0;
+
+    json_get_string(params, "path", path, sizeof(path));
+    json_get_string(params, "pattern", pattern, sizeof(pattern));
+
+    if (!path[0]) strcpy(path, ".");
+    if (!pattern[0]) strcpy(pattern, "*");
+
+    pos = snprintf(response, resplen, "{\"result\":[");
+    find_recursive(path, pattern, response, &pos, resplen - 10, &count, 200, 0);
+    snprintf(response + pos, resplen - pos, "]}");
+}
+
+/* Recursive search helper - searches file contents */
+static void search_recursive(const char *dir_path, const char *search_pattern, const char *file_pattern,
+                            char *result, size_t *pos, size_t maxlen, int *count, int max_results,
+                            int depth) {
+    DIR *dir;
+    struct dirent *ent;
+    char full_path[MAX_PATH];
+    struct stat st;
+    FILE *fp;
+    char line[4096];
+    int line_num;
+    char match_line[8192];
+    char escaped[8192];
+
+    /* Limit recursion depth to prevent stack overflow */
+    if (depth > 64) return;
+    if (*count >= max_results) return;
+
+    dir = opendir(dir_path);
+    if (!dir) return;
+
+    while ((ent = readdir(dir)) != NULL && *count < max_results) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+            continue;
+
+        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, ent->d_name);
+
+        /* Use lstat to NOT follow symlinks - prevents infinite loops */
+        if (lstat(full_path, &st) < 0) continue;
+
+        /* Skip symlinks entirely to avoid loops */
+        if (S_ISLNK(st.st_mode)) continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            /* Recurse into subdirectory */
+            search_recursive(full_path, search_pattern, file_pattern, result, pos, maxlen, count, max_results, depth + 1);
+        } else if (S_ISREG(st.st_mode)) {
+            /* Check file pattern if specified */
+            if (file_pattern[0] && !match_pattern(file_pattern, ent->d_name)) {
+                continue;
+            }
+
+            /* Search file contents */
+            fp = fopen(full_path, "r");
+            if (!fp) continue;
+
+            line_num = 0;
+            while (fgets(line, sizeof(line), fp) && *count < max_results) {
+                char *newline;
+                line_num++;
+
+                /* Remove trailing newline */
+                newline = strchr(line, '\n');
+                if (newline) *newline = '\0';
+                newline = strchr(line, '\r');
+                if (newline) *newline = '\0';
+
+                /* Check for match (simple substring search) */
+                if (strstr(line, search_pattern)) {
+                    /* Format: "path:linenum:line" */
+                    snprintf(match_line, sizeof(match_line), "%s:%d:%s", full_path, line_num, line);
+                    json_escape_string(match_line, escaped, sizeof(escaped));
+
+                    if (*pos + strlen(escaped) + 2 < maxlen) {
+                        if (*count > 0) result[(*pos)++] = ',';
+                        *pos += snprintf(result + *pos, maxlen - *pos, "%s", escaped);
+                        (*count)++;
+                    }
+                }
+            }
+
+            fclose(fp);
+        }
+    }
+
+    closedir(dir);
+}
+
+static void handle_fs_search(const char *params, char *response, size_t resplen) {
+    char path[MAX_PATH];
+    char pattern[512];
+    char file_pattern[256];
+    size_t pos;
+    int count = 0;
+
+    json_get_string(params, "path", path, sizeof(path));
+    json_get_string(params, "pattern", pattern, sizeof(pattern));
+    json_get_string(params, "filePattern", file_pattern, sizeof(file_pattern));
+
+    if (!path[0]) strcpy(path, ".");
+    if (!pattern[0]) {
+        snprintf(response, resplen, "{\"error\":\"pattern is required\"}");
+        return;
+    }
+
+    pos = snprintf(response, resplen, "{\"result\":[");
+    search_recursive(path, pattern, file_pattern, response, &pos, resplen - 10, &count, 200, 0);
+    snprintf(response + pos, resplen - pos, "]}");
+}
+
+static void handle_cp_exec(const char *params, char *response, size_t resplen) {
+    char command[MAX_PATH * 2];
+    char *output;
+    char *escaped_output;
+    FILE *fp;
+    size_t output_len = 0;
+    int status;
+
+    if (logfile) { fprintf(logfile, "[cp.exec] parsing command from: %.100s\n", params); fflush(logfile); }
+
+    json_get_string(params, "command", command, sizeof(command));
+
+    if (logfile) { fprintf(logfile, "[cp.exec] command: %s\n", command); fflush(logfile); }
+
+    output = malloc(BUFFER_SIZE);
+    if (!output) {
+        snprintf(response, resplen, "{\"error\":\"Out of memory\"}");
+        return;
+    }
+
+    if (logfile) { fprintf(logfile, "[cp.exec] calling popen...\n"); fflush(logfile); }
+
+    fp = popen(command, "r");
+    if (!fp) {
+        if (logfile) { fprintf(logfile, "[cp.exec] popen failed: %s\n", strerror(errno)); fflush(logfile); }
+        free(output);
+        snprintf(response, resplen, "{\"error\":\"%s\",\"status\":-1,\"stdout\":\"\",\"stderr\":\"\"}", strerror(errno));
+        return;
+    }
+
+    if (logfile) { fprintf(logfile, "[cp.exec] popen succeeded, reading output...\n"); fflush(logfile); }
+
+    while (output_len < BUFFER_SIZE - 1) {
+        size_t n = fread(output + output_len, 1, BUFFER_SIZE - 1 - output_len, fp);
+        if (n == 0) break;
+        output_len += n;
+    }
+    output[output_len] = '\0';
+
+    if (logfile) { fprintf(logfile, "[cp.exec] read %lu bytes, calling pclose...\n", (unsigned long)output_len); fflush(logfile); }
+
+    status = pclose(fp);
+
+    if (logfile) { fprintf(logfile, "[cp.exec] pclose returned %d\n", status); fflush(logfile); }
+
+    /* Extract exit status portably - NeXT uses union wait which doesn't work with int */
+#ifdef NEXT_COMPAT
+    if ((status & 0xff) == 0) {
+        status = (status >> 8) & 0xff;
+    }
+#else
+    if (WIFEXITED(status)) {
+        status = WEXITSTATUS(status);
+    }
+#endif
+
+    if (logfile) { fprintf(logfile, "[cp.exec] exit status: %d, output_len: %lu\n", status, (unsigned long)output_len); fflush(logfile); }
+
+    escaped_output = malloc(output_len * 2 + 3);
+    if (!escaped_output) {
+        free(output);
+        snprintf(response, resplen, "{\"error\":\"Out of memory\"}");
+        return;
+    }
+
+    json_escape_string(output, escaped_output, output_len * 2 + 3);
+
+    if (logfile) { fprintf(logfile, "[cp.exec] building response...\n"); fflush(logfile); }
+
+    snprintf(response, resplen, "{\"result\":{\"status\":%d,\"stdout\":%s,\"stderr\":\"\"}}",
+             status, escaped_output);
+
+    if (logfile) { fprintf(logfile, "[cp.exec] done, response: %.100s...\n", response); fflush(logfile); }
+
+    free(output);
+    free(escaped_output);
+}
+
+static void handle_request(const char *json, char *response, size_t resplen) {
+    char op[64];
+    char *params_buf;
+    char *params;
+    long req_id;
+    size_t params_len;
+
+    if (logfile) { fprintf(logfile, "[handle_request] parsing...\n"); fflush(logfile); }
+
+    req_id = json_get_int(json, "id");
+    json_get_string(json, "op", op, sizeof(op));
+
+    if (logfile) { fprintf(logfile, "[handle_request] id=%ld op=%s\n", req_id, op); fflush(logfile); }
+
+    /* Extract params object - find "params":{...} */
+    params = strstr(json, "\"params\":");
+    if (params) {
+        params += 9;
+        while (*params == ' ') params++;
+        params_len = strlen(params);
+        params_buf = malloc(params_len + 1);
+        if (!params_buf) {
+            snprintf(response, resplen, "{\"type\":\"response\",\"id\":%ld,\"error\":\"Out of memory\"}", req_id);
+            return;
+        }
+        strncpy(params_buf, params, params_len);
+        params_buf[params_len] = '\0';
+    } else {
+        params_buf = malloc(3);
+        if (!params_buf) {
+            snprintf(response, resplen, "{\"type\":\"response\",\"id\":%ld,\"error\":\"Out of memory\"}", req_id);
+            return;
+        }
+        strcpy(params_buf, "{}");
+    }
+
+    if (logfile) { fprintf(logfile, "[handle_request] params: %.100s\n", params_buf); fflush(logfile); }
+
+    /* Route to handler */
+    if (strcmp(op, "fs.readFile") == 0) {
+        handle_fs_readFile(params_buf, result_buffer, BUFFER_SIZE);
+    } else if (strcmp(op, "fs.writeFile") == 0) {
+        handle_fs_writeFile(params_buf, result_buffer, BUFFER_SIZE);
+    } else if (strcmp(op, "fs.stat") == 0) {
+        handle_fs_stat(params_buf, result_buffer, BUFFER_SIZE);
+    } else if (strcmp(op, "fs.lstat") == 0) {
+        handle_fs_lstat(params_buf, result_buffer, BUFFER_SIZE);
+    } else if (strcmp(op, "fs.readdir") == 0) {
+        handle_fs_readdir(params_buf, result_buffer, BUFFER_SIZE);
+    } else if (strcmp(op, "fs.exists") == 0) {
+        handle_fs_exists(params_buf, result_buffer, BUFFER_SIZE);
+    } else if (strcmp(op, "fs.mkdir") == 0) {
+        handle_fs_mkdir(params_buf, result_buffer, BUFFER_SIZE);
+    } else if (strcmp(op, "fs.unlink") == 0) {
+        handle_fs_unlink(params_buf, result_buffer, BUFFER_SIZE);
+    } else if (strcmp(op, "fs.rename") == 0) {
+        handle_fs_rename(params_buf, result_buffer, BUFFER_SIZE);
+    } else if (strcmp(op, "fs.access") == 0) {
+        handle_fs_access(params_buf, result_buffer, BUFFER_SIZE);
+    } else if (strcmp(op, "fs.realpath") == 0) {
+        handle_fs_realpath(params_buf, result_buffer, BUFFER_SIZE);
+    } else if (strcmp(op, "fs.find") == 0) {
+        handle_fs_find(params_buf, result_buffer, BUFFER_SIZE);
+    } else if (strcmp(op, "fs.search") == 0) {
+        handle_fs_search(params_buf, result_buffer, BUFFER_SIZE);
+    } else if (strcmp(op, "cp.exec") == 0 || strcmp(op, "cp.spawn") == 0) {
+        if (logfile) { fprintf(logfile, "[handle_request] calling handle_cp_exec\n"); fflush(logfile); }
+        handle_cp_exec(params_buf, result_buffer, BUFFER_SIZE);
+        if (logfile) { fprintf(logfile, "[handle_request] handle_cp_exec returned\n"); fflush(logfile); }
+    } else {
+        snprintf(result_buffer, BUFFER_SIZE, "{\"error\":\"Unknown operation: %s\"}", op);
+    }
+
+    /* Wrap response with ID and type */
+    snprintf(response, resplen, "{\"type\":\"response\",\"id\":%ld,%s",
+             req_id, result_buffer + 1);  /* Skip opening { of result_buffer */
+
+    free(params_buf);
+}
+
+/* ============================================================================
+ * Main loop
+ * ============================================================================ */
+
+static void main_loop(void) {
+    fd_set readfds;
+    struct timeval tv;
+    int maxfd, rows, cols, n, len;
+    char input_buf[256];
+    char escaped[512];
+    char type[32];
+    char *data;
+    char *filtered;
+    size_t datalen, flen, x;
+
+    enable_raw_mode();
+
+    /* Set up SIGWINCH handler */
+    signal(SIGWINCH, sigwinch_handler);
+
+    /* Send initial terminal size */
+    get_terminal_size(&rows, &cols);
+    snprintf(send_buffer, BUFFER_SIZE, "{\"type\":\"resize\",\"rows\":%d,\"cols\":%d}", rows, cols);
+    send_message(send_buffer);
+
+    maxfd = (sockfd > STDIN_FILENO) ? sockfd : STDIN_FILENO;
+
+    while (1) {
+        /* Handle window resize */
+        if (got_sigwinch) {
+            got_sigwinch = 0;
+            get_terminal_size(&rows, &cols);
+            snprintf(send_buffer, BUFFER_SIZE, "{\"type\":\"resize\",\"rows\":%d,\"cols\":%d}", rows, cols);
+            send_message(send_buffer);
+        }
+
+        FD_ZERO(&readfds);
+        FD_SET(sockfd, &readfds);
+        FD_SET(STDIN_FILENO, &readfds);
+
+        tv.tv_sec = 0;
+        tv.tv_usec = 100000;  /* 100ms */
+
+        if (select(maxfd + 1, &readfds, NULL, NULL, &tv) < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+
+        /* Handle terminal input */
+        if (FD_ISSET(STDIN_FILENO, &readfds)) {
+            n = read(STDIN_FILENO, input_buf, sizeof(input_buf) - 1);
+            if (n > 0) {
+                input_buf[n] = '\0';
+
+                /* Debug: log input bytes in hex */
+                if (logfile) {
+                    int ii;
+                    fprintf(logfile, "[INPUT] %d bytes: ", n);
+                    for (ii = 0; ii < n; ii++) {
+                        fprintf(logfile, "%02x ", (unsigned char)input_buf[ii]);
+                    }
+                    fprintf(logfile, " = \"");
+                    for (ii = 0; ii < n; ii++) {
+                        unsigned char c = (unsigned char)input_buf[ii];
+                        if (c >= 32 && c < 127) {
+                            fprintf(logfile, "%c", c);
+                        } else if (c == 27) {
+                            fprintf(logfile, "<ESC>");
+                        } else {
+                            fprintf(logfile, "<%02x>", c);
+                        }
+                    }
+                    fprintf(logfile, "\"\n");
+                    fflush(logfile);
+                }
+
+                json_escape_string(input_buf, escaped, sizeof(escaped));
+                snprintf(send_buffer, BUFFER_SIZE, "{\"type\":\"terminal_input\",\"data\":%s}", escaped);
+                send_message(send_buffer);
+            }
+        }
+
+        /* Handle messages from relay */
+        if (FD_ISSET(sockfd, &readfds)) {
+            len = recv_message(recv_buffer, BUFFER_SIZE);
+            if (len <= 0) {
+                fprintf(stderr, "\r\nConnection closed\r\n");
+                break;
+            }
+
+            json_get_string(recv_buffer, "type", type, sizeof(type));
+
+            if (strcmp(type, "terminal_output") == 0) {
+                data = malloc(len + 1);
+                if (data) {
+                    json_get_string(recv_buffer, "data", data, len + 1);
+                    datalen = strlen(data);
+
+                    if (logfile) {
+                        fprintf(logfile, "=== RECV len=%d datalen=%zu simple=%d ===\n",
+                                len, datalen, simple_mode);
+                        /* Log hex dump of first 200 bytes */
+                        fprintf(logfile, "HEX: ");
+                        for (x = 0; x < datalen && x < 200; x++) {
+                            fprintf(logfile, "%02x ", (unsigned char)data[x]);
+                        }
+                        fprintf(logfile, "\n");
+                        fflush(logfile);
+                    }
+
+                    if (simple_mode) {
+                        filtered = malloc(len + 1);
+                        if (filtered) {
+                            flen = filter_terminal_output(data, filtered, len + 1);
+
+                            if (logfile) {
+                                fprintf(logfile, "FILTERED len=%zu\n", flen);
+                                fprintf(logfile, "HEX: ");
+                                for (x = 0; x < flen && x < 200; x++) {
+                                    fprintf(logfile, "%02x ", (unsigned char)filtered[x]);
+                                }
+                                fprintf(logfile, "\n---\n");
+                                fflush(logfile);
+                            }
+
+                            write(STDOUT_FILENO, filtered, flen);
+                            free(filtered);
+                        }
+                    } else {
+                        write(STDOUT_FILENO, data, datalen);
+                    }
+                    free(data);
+                }
+            } else if (strcmp(type, "request") == 0) {
+                if (logfile) {
+                    fprintf(logfile, "=== REQUEST received ===\n");
+                    fprintf(logfile, "RAW: %.200s...\n", recv_buffer);
+                    fflush(logfile);
+                }
+                handle_request(recv_buffer, send_buffer, BUFFER_SIZE);
+                if (logfile) {
+                    fprintf(logfile, "=== RESPONSE ready ===\n");
+                    fprintf(logfile, "RAW: %.200s...\n", send_buffer);
+                    fflush(logfile);
+                }
+                send_message(send_buffer);
+                if (logfile) {
+                    fprintf(logfile, "=== RESPONSE sent ===\n");
+                    fflush(logfile);
+                }
+            } else if (logfile && type[0] != '\0') {
+                fprintf(logfile, "=== UNKNOWN type: '%s' ===\n", type);
+                fprintf(logfile, "RAW: %.200s...\n", recv_buffer);
+                fflush(logfile);
+            }
+        }
+    }
+
+    disable_raw_mode();
+}
+
+/* ============================================================================
+ * Main
+ * ============================================================================ */
+
+int main(int argc, char *argv[]) {
+    const char *host;
+    int port;
+    int i;
+
+    /* Parse options */
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--simple") == 0) {
+            simple_mode = 1;
+        } else if (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "--log") == 0) {
+            logfile = fopen("/tmp/telepresence.log", "w");
+            if (logfile) {
+                fprintf(stderr, "*** Logging enabled: /tmp/telepresence.log ***\n");
+                fprintf(logfile, "=== Log started ===\n");
+                fflush(logfile);
+            } else {
+                fprintf(stderr, "*** Failed to open log file! ***\n");
+            }
+        }
+    }
+
+    /* Find host and port (non-flag arguments) */
+    host = NULL;
+    port = 0;
+    for (i = 1; i < argc; i++) {
+        if (argv[i][0] != '-') {
+            if (!host) {
+                host = argv[i];
+            } else if (!port) {
+                port = atoi(argv[i]);
+            }
+        }
+    }
+
+    if (!host || !port) {
+        fprintf(stderr, "Usage: %s [-s] [-l] <host> <port>\n", argv[0]);
+        fprintf(stderr, "Connect to claude-telepresence relay server\n");
+        fprintf(stderr, "\nOptions:\n");
+        fprintf(stderr, "  -s, --simple   Simple mode: convert Unicode to ASCII\n");
+        fprintf(stderr, "  -l, --log      Log to /tmp/telepresence.log\n");
+        return 1;
+    }
+
+    /* Allocate buffers */
+    recv_buffer = malloc(BUFFER_SIZE);
+    send_buffer = malloc(BUFFER_SIZE);
+    json_buffer = malloc(BUFFER_SIZE);
+    result_buffer = malloc(BUFFER_SIZE);
+
+    if (!recv_buffer || !send_buffer || !json_buffer || !result_buffer) {
+        fprintf(stderr, "Failed to allocate buffers\n");
+        return 1;
+    }
+
+    fprintf(stderr, "Connecting to %s:%d (simple=%d, log=%s)...\n",
+            host, port, simple_mode, logfile ? "yes" : "no");
+
+    if (connect_to_relay(host, port) < 0) {
+        return 1;
+    }
+
+    /* Send hello with cwd so relay knows our working directory */
+    {
+        char cwd[MAX_PATH];
+        char escaped_cwd[MAX_PATH * 2];
+        char *p, *q;
+
+#ifdef NEXT_COMPAT
+        /* NeXT uses getwd() instead of getcwd() */
+        if (getwd(cwd) == NULL) {
+            strcpy(cwd, "/");
+        }
+#else
+        if (getcwd(cwd, sizeof(cwd)) == NULL) {
+            strcpy(cwd, "/");
+        }
+#endif
+
+        /* Escape cwd for JSON */
+        p = cwd;
+        q = escaped_cwd;
+        while (*p && q < escaped_cwd + sizeof(escaped_cwd) - 2) {
+            if (*p == '"' || *p == '\\') {
+                *q++ = '\\';
+            }
+            *q++ = *p++;
+        }
+        *q = '\0';
+
+        snprintf(send_buffer, BUFFER_SIZE,
+                 "{\"type\":\"hello\",\"cwd\":\"%s\"}", escaped_cwd);
+        send_message(send_buffer);
+    }
+
+    fprintf(stderr, "Connected! Starting Claude Code session...\n\n");
+
+    main_loop();
+
+    if (sockfd >= 0) close(sockfd);
+    free(recv_buffer);
+    free(send_buffer);
+    free(json_buffer);
+    free(result_buffer);
+
+    return 0;
+}
