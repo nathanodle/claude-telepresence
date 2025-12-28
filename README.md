@@ -4,6 +4,8 @@ Run Claude Code on modern Linux while operating on legacy Unix systems (NeXTSTEP
 
 > **⚠️ Security Warning:** This tool is designed for vintage systems that cannot support modern security. There is **no encryption** - all traffic (including terminal I/O and file contents) is sent in plain text over TCP. Do not use on untrusted networks. Run on isolated/private networks only. **Use at your own risk.**
 
+> **🤖 AI-Generated Code:** This codebase was written primarily by Claude (Anthropic's AI) and has not been thoroughly reviewed by a human. It may contain bugs, security vulnerabilities, or other issues. Review the code yourself before using in any important context.
+
 ```
 +-----------------------+         TCP          +-----------------------+
 |   Legacy Unix Box     |<-------------------->|    Linux Host         |
