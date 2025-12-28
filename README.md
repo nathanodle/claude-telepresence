@@ -102,12 +102,13 @@ You'll see the Claude Code TUI. All your commands and file operations happen on 
 Options:
   -s    Simple mode: Convert Unicode to ASCII for old terminals
         (recommended for NeXTSTEP, older HP-UX, etc.)
+  -r    Resume previous conversation (continues where you left off)
   -l    Enable debug logging to /tmp/telepresence.log
 ```
 
 Example with all options:
 ```bash
-./claude-telepresence -s -l 192.168.1.100 5000
+./claude-telepresence -s -r -l 192.168.1.100 5000
 ```
 
 ## How It Works

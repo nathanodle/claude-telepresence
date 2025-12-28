@@ -291,6 +291,7 @@ class TelepresenceRelay:
         self.mcp_request_id = 0
         self.mcp_session_id = None
         self.remote_cwd = None  # Remote client's working directory
+        self.resume_session = False  # Whether to resume previous session
 
     async def start(self):
         """Start the relay server."""
@@ -347,14 +348,18 @@ class TelepresenceRelay:
         self.client_writer = writer
 
         try:
-            # Wait for hello message from client to get remote cwd
+            # Wait for hello message from client to get remote cwd and options
             hello_msg = await self.recv_from_client()
             if hello_msg and hello_msg.get('type') == 'hello':
                 self.remote_cwd = hello_msg.get('cwd', '/')
+                self.resume_session = hello_msg.get('resume', False)
                 print(f"[relay] Remote cwd: {self.remote_cwd}")
+                if self.resume_session:
+                    print(f"[relay] Resume requested: will continue previous session")
             else:
                 print(f"[relay] Warning: Expected hello message, got: {hello_msg}")
                 self.remote_cwd = '/tmp'
+                self.resume_session = False
 
             # Spawn Claude Code with PTY (using remote cwd)
             self.spawn_claude()
@@ -555,6 +560,10 @@ SHELL: Bash commands execute on the remote system automatically.
         base_args = ['--settings', settings_json_path,
                      '--mcp-config', mcp_json_path, '--strict-mcp-config',
                      '--append-system-prompt', system_prompt]
+
+        # Add --resume if client requested it
+        if self.resume_session:
+            base_args.insert(0, '--resume')
 
         if claude_cmd == 'claude':
             cmd_parts = ['claude'] + base_args

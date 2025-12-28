@@ -115,6 +115,7 @@ static struct termios orig_termios;
 #endif
 static int raw_mode = 0;
 static int simple_mode = 0;  /* Filter fancy terminal effects */
+static int resume_mode = 0;  /* Resume previous session */
 static FILE *logfile = NULL; /* Debug log */
 
 /* Buffers */
@@ -1726,6 +1727,8 @@ int main(int argc, char *argv[]) {
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--simple") == 0) {
             simple_mode = 1;
+        } else if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--resume") == 0) {
+            resume_mode = 1;
         } else if (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "--log") == 0) {
             logfile = fopen("/tmp/telepresence.log", "w");
             if (logfile) {
@@ -1752,10 +1755,11 @@ int main(int argc, char *argv[]) {
     }
 
     if (!host || !port) {
-        fprintf(stderr, "Usage: %s [-s] [-l] <host> <port>\n", argv[0]);
+        fprintf(stderr, "Usage: %s [-s] [-r] [-l] <host> <port>\n", argv[0]);
         fprintf(stderr, "Connect to claude-telepresence relay server\n");
         fprintf(stderr, "\nOptions:\n");
         fprintf(stderr, "  -s, --simple   Simple mode: convert Unicode to ASCII\n");
+        fprintf(stderr, "  -r, --resume   Resume previous conversation\n");
         fprintf(stderr, "  -l, --log      Log to /tmp/telepresence.log\n");
         return 1;
     }
@@ -1806,8 +1810,13 @@ int main(int argc, char *argv[]) {
         }
         *q = '\0';
 
-        snprintf(send_buffer, BUFFER_SIZE,
-                 "{\"type\":\"hello\",\"cwd\":\"%s\"}", escaped_cwd);
+        if (resume_mode) {
+            snprintf(send_buffer, BUFFER_SIZE,
+                     "{\"type\":\"hello\",\"cwd\":\"%s\",\"resume\":true}", escaped_cwd);
+        } else {
+            snprintf(send_buffer, BUFFER_SIZE,
+                     "{\"type\":\"hello\",\"cwd\":\"%s\"}", escaped_cwd);
+        }
         send_message(send_buffer);
     }
 
