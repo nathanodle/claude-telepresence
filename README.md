@@ -52,10 +52,12 @@ make telepresence-helper
 python3 relay.py --port 5000
 ```
 
-The relay will:
-- Copy the helper binary to `/tmp/telepresence-helper`
+The relay will automatically:
+- Copy `telepresence-helper` from the repo directory to `/tmp/telepresence-helper`
 - Start an MCP server on port 5001
 - Wait for a client connection on port 5000
+
+**Note:** The helper must be built before starting the relay. It's used by Claude's hooks to proxy shell commands to the legacy system.
 
 ### 2. Setup Legacy Client
 
