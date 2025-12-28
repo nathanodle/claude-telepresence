@@ -65,15 +65,37 @@
 #endif
 #endif
 
-/* snprintf compatibility for old systems */
+/* snprintf compatibility for NeXTSTEP and other vintage Unix systems.
+ *
+ * IMPORTANT: This shim uses vsprintf which has NO bounds checking.
+ * Unlike real snprintf, this WILL overflow if output exceeds size.
+ *
+ * Safety is ensured by auditing all call sites in this codebase:
+ * - readFile: file size capped at 7MB, base64 fits in 10MB buffer
+ * - cp.exec: output capped at 4MB, escaped fits in 10MB buffer
+ * - readdir: full_path buffer increased to MAX_PATH+256
+ * - search: match buffers increased to 8KB/16KB
+ * - All other calls use fixed-format strings with bounded output
+ *
+ * The shim guarantees null-termination if overflow is detected after
+ * the fact, but by then memory corruption has already occurred.
+ * DO NOT add new snprintf calls without verifying buffer adequacy. */
 #ifdef NEXT_COMPAT
 #include <stdarg.h>
 static int snprintf(char *buf, size_t size, const char *fmt, ...) {
     va_list ap;
     int ret;
+
+    if (size == 0) return 0;
+
     va_start(ap, fmt);
     ret = vsprintf(buf, fmt, ap);
     va_end(ap);
+
+    /* Null-terminate if we can detect overflow (too late, but helps debugging) */
+    if (ret >= (int)size) {
+        buf[size - 1] = '\0';
+    }
     return ret;
 }
 #endif
@@ -722,6 +744,7 @@ static int recv_message(char *buf, size_t buflen) {
 static void handle_fs_readFile(const char *params, char *response, size_t resplen) {
     char path[MAX_PATH];
     FILE *fp;
+    long file_len_signed;
     size_t file_len;
     char *content;
     char *encoded;
@@ -736,8 +759,17 @@ static void handle_fs_readFile(const char *params, char *response, size_t resple
     }
 
     fseek(fp, 0, SEEK_END);
-    file_len = ftell(fp);
+    file_len_signed = ftell(fp);
     fseek(fp, 0, SEEK_SET);
+
+    /* Validate file_len to prevent overflow/underflow issues.
+     * Max 7MB so base64 (~9.3MB) + JSON wrapper fits in 10MB response buffer */
+    if (file_len_signed < 0 || file_len_signed > 7 * 1024 * 1024) {
+        fclose(fp);
+        snprintf(response, resplen, "{\"error\":\"File too large (max 7MB)\"}");
+        return;
+    }
+    file_len = (size_t)file_len_signed;
 
     content = malloc(file_len + 1);
     if (!content) {
@@ -818,7 +850,8 @@ static void handle_fs_writeFile(const char *params, char *response, size_t respl
                 -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1
             };
             size_t i, j = 0;
-            for (i = 0; i < data_len; i += 4) {
+            /* Process only complete 4-byte groups to avoid buffer over-read */
+            for (i = 0; i + 3 < data_len; i += 4) {
                 int a = d[(unsigned char)data[i]];
                 int b = d[(unsigned char)data[i+1]];
                 int c = d[(unsigned char)data[i+2]];
@@ -936,7 +969,7 @@ static void handle_fs_readdir(const char *params, char *response, size_t resplen
 
     while ((ent = readdir(dir)) != NULL) {
         char escaped_name[1024];
-        char full_path[MAX_PATH];
+        char full_path[MAX_PATH + 256];  /* path + "/" + d_name (up to 255) */
         struct stat st;
 
         if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
@@ -1085,9 +1118,9 @@ static void find_recursive(const char *dir_path, const char *pattern,
                           int depth) {
     DIR *dir;
     struct dirent *ent;
-    char full_path[MAX_PATH];
+    char full_path[MAX_PATH + 256];  /* path + "/" + d_name */
     struct stat st;
-    char escaped[MAX_PATH * 2];
+    char escaped[MAX_PATH * 2 + 512];
 
     /* Limit recursion depth to prevent stack overflow */
     if (depth > 64) return;
@@ -1145,72 +1178,176 @@ static void handle_fs_find(const char *params, char *response, size_t resplen) {
 }
 
 /* Recursive search helper - searches file contents */
+/* Static buffers for search to avoid stack bloat during recursion.
+ * search_match_buf must hold: path (4352) + ":" + linenum + ":" + line (2048) ≈ 6500
+ * search_escaped_buf could double in worst case */
+static char search_line_buf[2048];
+static char search_match_buf[8192];
+static char search_escaped_buf[16384];
+
+/* Check if directory should be skipped */
+static int skip_directory(const char *name) {
+    /* Skip hidden directories (., .., .git, .svn, etc.) */
+    if (name[0] == '.') return 1;
+    /* Skip known large/slow directories */
+    if (strcmp(name, "node_modules") == 0) return 1;
+    if (strcmp(name, "__pycache__") == 0) return 1;
+    if (strcmp(name, "CVS") == 0) return 1;
+    if (strcmp(name, "RCS") == 0) return 1;
+    return 0;
+}
+
+/* Check if file extension suggests binary */
+static int is_binary_extension(const char *name) {
+    const char *ext = strrchr(name, '.');
+    if (!ext) return 0;
+    if (strcmp(ext, ".o") == 0 || strcmp(ext, ".a") == 0 ||
+        strcmp(ext, ".so") == 0 || strcmp(ext, ".dylib") == 0 ||
+        strcmp(ext, ".gz") == 0 || strcmp(ext, ".tar") == 0 ||
+        strcmp(ext, ".zip") == 0 || strcmp(ext, ".Z") == 0 ||
+        strcmp(ext, ".jpg") == 0 || strcmp(ext, ".jpeg") == 0 ||
+        strcmp(ext, ".png") == 0 || strcmp(ext, ".gif") == 0 ||
+        strcmp(ext, ".tiff") == 0 || strcmp(ext, ".tif") == 0 ||
+        strcmp(ext, ".pdf") == 0 || strcmp(ext, ".ps") == 0 ||
+        strcmp(ext, ".exe") == 0 || strcmp(ext, ".bin") == 0 ||
+        strcmp(ext, ".obj") == 0 || strcmp(ext, ".class") == 0 ||
+        strcmp(ext, ".pyc") == 0 || strcmp(ext, ".pyo") == 0) {
+        return 1;
+    }
+    return 0;
+}
+
 static void search_recursive(const char *dir_path, const char *search_pattern, const char *file_pattern,
-                            char *result, size_t *pos, size_t maxlen, int *count, int max_results,
+                            char *result, size_t *pos, size_t maxlen,
+                            int *match_count, int max_matches,
+                            int *file_count, int max_files,
                             int depth) {
     DIR *dir;
     struct dirent *ent;
-    char full_path[MAX_PATH];
+    char full_path[MAX_PATH + 256];  /* path + "/" + d_name */
     struct stat st;
-    FILE *fp;
-    char line[4096];
-    int line_num;
-    char match_line[8192];
-    char escaped[8192];
 
-    /* Limit recursion depth to prevent stack overflow */
-    if (depth > 64) return;
-    if (*count >= max_results) return;
+    /* Limit recursion depth - use smaller limit to save stack */
+    if (depth > 32) return;
+    if (*match_count >= max_matches) return;
+    if (*file_count >= max_files) return;
 
     dir = opendir(dir_path);
     if (!dir) return;
 
-    while ((ent = readdir(dir)) != NULL && *count < max_results) {
-        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+    while ((ent = readdir(dir)) != NULL) {
+        /* Check limits */
+        if (*match_count >= max_matches) break;
+        if (*file_count >= max_files) break;
+
+        /* Skip . and .. */
+        if (ent->d_name[0] == '.' &&
+            (ent->d_name[1] == '\0' ||
+             (ent->d_name[1] == '.' && ent->d_name[2] == '\0')))
             continue;
 
         snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, ent->d_name);
 
-        /* Use lstat to NOT follow symlinks - prevents infinite loops */
+        /* Use lstat to NOT follow symlinks */
         if (lstat(full_path, &st) < 0) continue;
 
-        /* Skip symlinks entirely to avoid loops */
+        /* Skip symlinks */
         if (S_ISLNK(st.st_mode)) continue;
 
         if (S_ISDIR(st.st_mode)) {
-            /* Recurse into subdirectory */
-            search_recursive(full_path, search_pattern, file_pattern, result, pos, maxlen, count, max_results, depth + 1);
+            /* Skip problematic directories */
+            if (skip_directory(ent->d_name)) continue;
+            /* Recurse */
+            search_recursive(full_path, search_pattern, file_pattern, result, pos, maxlen,
+                           match_count, max_matches, file_count, max_files, depth + 1);
         } else if (S_ISREG(st.st_mode)) {
-            /* Check file pattern if specified */
-            if (file_pattern[0] && !match_pattern(file_pattern, ent->d_name)) {
-                continue;
-            }
+            FILE *fp;
+            int line_num;
+            int is_binary;
+            size_t i, n;
+            char *newline;
 
-            /* Search file contents */
+            /* Check file pattern */
+            if (file_pattern[0] && !match_pattern(file_pattern, ent->d_name)) continue;
+
+            /* Skip by extension */
+            if (is_binary_extension(ent->d_name)) continue;
+
+            /* Skip large files (>512KB) */
+            if (st.st_size > 512 * 1024) continue;
+
+            /* Skip empty files */
+            if (st.st_size == 0) continue;
+
+            /* Count this file */
+            (*file_count)++;
+
+            /* Open and check for binary content */
             fp = fopen(full_path, "r");
             if (!fp) continue;
 
-            line_num = 0;
-            while (fgets(line, sizeof(line), fp) && *count < max_results) {
-                char *newline;
+            /* Read first chunk and check for nulls */
+            n = fread(search_line_buf, 1, 512, fp);
+            is_binary = 0;
+            for (i = 0; i < n; i++) {
+                if (search_line_buf[i] == '\0') {
+                    is_binary = 1;
+                    break;
+                }
+            }
+            if (is_binary) {
+                fclose(fp);
+                continue;
+            }
+
+            /* Search the first chunk we already read */
+            search_line_buf[n] = '\0';
+            line_num = 1;
+
+            /* Process already-read data line by line */
+            {
+                char *line_start = search_line_buf;
+                char *line_end;
+                while ((line_end = strchr(line_start, '\n')) != NULL && *match_count < max_matches) {
+                    *line_end = '\0';
+                    /* Remove CR if present */
+                    if (line_end > line_start && *(line_end-1) == '\r')
+                        *(line_end-1) = '\0';
+
+                    if (strstr(line_start, search_pattern)) {
+                        snprintf(search_match_buf, sizeof(search_match_buf), "%s:%d:%s",
+                                full_path, line_num, line_start);
+                        json_escape_string(search_match_buf, search_escaped_buf, sizeof(search_escaped_buf));
+                        if (*pos + strlen(search_escaped_buf) + 2 < maxlen) {
+                            if (*match_count > 0) result[(*pos)++] = ',';
+                            *pos += snprintf(result + *pos, maxlen - *pos, "%s", search_escaped_buf);
+                            (*match_count)++;
+                        }
+                    }
+                    line_num++;
+                    line_start = line_end + 1;
+                }
+            }
+
+            /* Continue reading rest of file */
+            while (fgets(search_line_buf, sizeof(search_line_buf), fp) && *match_count < max_matches) {
                 line_num++;
+                if (line_num > 5000) break;  /* Limit lines per file */
 
-                /* Remove trailing newline */
-                newline = strchr(line, '\n');
+                /* Remove newlines */
+                newline = strchr(search_line_buf, '\n');
                 if (newline) *newline = '\0';
-                newline = strchr(line, '\r');
+                newline = strchr(search_line_buf, '\r');
                 if (newline) *newline = '\0';
 
-                /* Check for match (simple substring search) */
-                if (strstr(line, search_pattern)) {
-                    /* Format: "path:linenum:line" */
-                    snprintf(match_line, sizeof(match_line), "%s:%d:%s", full_path, line_num, line);
-                    json_escape_string(match_line, escaped, sizeof(escaped));
-
-                    if (*pos + strlen(escaped) + 2 < maxlen) {
-                        if (*count > 0) result[(*pos)++] = ',';
-                        *pos += snprintf(result + *pos, maxlen - *pos, "%s", escaped);
-                        (*count)++;
+                if (strstr(search_line_buf, search_pattern)) {
+                    snprintf(search_match_buf, sizeof(search_match_buf), "%s:%d:%s",
+                            full_path, line_num, search_line_buf);
+                    json_escape_string(search_match_buf, search_escaped_buf, sizeof(search_escaped_buf));
+                    if (*pos + strlen(search_escaped_buf) + 2 < maxlen) {
+                        if (*match_count > 0) result[(*pos)++] = ',';
+                        *pos += snprintf(result + *pos, maxlen - *pos, "%s", search_escaped_buf);
+                        (*match_count)++;
                     }
                 }
             }
@@ -1240,12 +1377,16 @@ static void handle_fs_search(const char *params, char *response, size_t resplen)
     }
 
     pos = snprintf(response, resplen, "{\"result\":[");
-    search_recursive(path, pattern, file_pattern, response, &pos, resplen - 10, &count, 200, 0);
+    {
+        int file_count = 0;
+        search_recursive(path, pattern, file_pattern, response, &pos, resplen - 10, &count, 200, &file_count, 500, 0);
+    }
     snprintf(response + pos, resplen - pos, "]}");
 }
 
 static void handle_cp_exec(const char *params, char *response, size_t resplen) {
     char command[MAX_PATH * 2];
+    char wrapped_cmd[MAX_PATH * 2 + 32];
     char *output;
     char *escaped_output;
     FILE *fp;
@@ -1264,9 +1405,14 @@ static void handle_cp_exec(const char *params, char *response, size_t resplen) {
         return;
     }
 
-    if (logfile) { fprintf(logfile, "[cp.exec] calling popen...\n"); fflush(logfile); }
+    /* Wrap command to capture stderr (including shell errors like "command not found")
+     * The { cmd; } 2>&1 construct captures all stderr while preserving any
+     * redirections the command itself has (they apply inside the group) */
+    snprintf(wrapped_cmd, sizeof(wrapped_cmd), "{ %s; } 2>&1", command);
 
-    fp = popen(command, "r");
+    if (logfile) { fprintf(logfile, "[cp.exec] calling popen with: %s\n", wrapped_cmd); fflush(logfile); }
+
+    fp = popen(wrapped_cmd, "r");
     if (!fp) {
         if (logfile) { fprintf(logfile, "[cp.exec] popen failed: %s\n", strerror(errno)); fflush(logfile); }
         free(output);
@@ -1276,12 +1422,16 @@ static void handle_cp_exec(const char *params, char *response, size_t resplen) {
 
     if (logfile) { fprintf(logfile, "[cp.exec] popen succeeded, reading output...\n"); fflush(logfile); }
 
-    while (output_len < BUFFER_SIZE - 1) {
-        size_t n = fread(output + output_len, 1, BUFFER_SIZE - 1 - output_len, fp);
-        if (n == 0) break;
-        output_len += n;
+    /* Cap output at 4MB so escaped (up to 8MB) + JSON wrapper fits in 10MB response */
+    {
+        size_t max_output = 4 * 1024 * 1024;
+        while (output_len < max_output) {
+            size_t n = fread(output + output_len, 1, max_output - output_len, fp);
+            if (n == 0) break;
+            output_len += n;
+        }
+        output[output_len] = '\0';
     }
-    output[output_len] = '\0';
 
     if (logfile) { fprintf(logfile, "[cp.exec] read %lu bytes, calling pclose...\n", (unsigned long)output_len); fflush(logfile); }
 
