@@ -196,6 +196,12 @@ The relay provides these tools to Claude (used automatically):
 - The relay auto-copies the helper to `/tmp/telepresence-helper`
 - Check that `/tmp` is writable on the Linux host
 
+## Known Limitations
+
+**Command timeouts:** Long-running commands may timeout before completion. The relay and client have built-in timeouts that aren't currently configurable. For very long operations, consider breaking them into smaller steps or running them in the background with output redirected to a file. *Configurable timeouts coming in a future release.*
+
+**File transfer size limits:** The `download_url` tool and file operations use fixed-size buffers (currently ~7-10MB). Very large file downloads or transfers may fail or be truncated. For large files, consider using traditional transfer methods (FTP, NFS, etc.) instead of the telepresence file operations. *Improved buffer handling coming in a future release.*
+
 ## Documentation
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed technical documentation.
