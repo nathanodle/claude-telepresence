@@ -71,7 +71,12 @@ Transfer `client.c` to your legacy system (via FTP, NFS, or however you move fil
 # NeXTSTEP
 cc -o claude-telepresence client.c
 
-# HP-UX / Solaris
+# HP-UX with ANSI C compiler
+cc -Aa -o claude-telepresence client.c
+# or with bundled K&R compiler (see below)
+cc -o claude-telepresence client_kr.c
+
+# Solaris
 cc -o claude-telepresence client.c -lsocket -lnsl
 
 # IRIX / AIX / Tru64
@@ -83,6 +88,22 @@ cc -o claude-telepresence client.c
 # Linux (for testing)
 gcc -o claude-telepresence client.c
 ```
+
+#### HP-UX with Bundled (K&R) Compiler
+
+Older HP-UX systems may only have the bundled K&R C compiler, which doesn't support ANSI C89 features like function prototypes. If you see errors like:
+
+```
+(Bundled) cc: "client.c", line 130: error 1705: Function prototypes are an ANSI feature.
+```
+
+Use the K&R-compatible version instead:
+
+```bash
+cc -o claude-telepresence client_kr.c
+```
+
+This version has all the same functionality but uses pre-ANSI K&R C syntax. No additional libraries are needed on HP-UX.
 
 ### 3. Connect
 
@@ -155,7 +176,8 @@ The relay provides these tools to Claude (used automatically):
 
 **Client won't compile:**
 - Check you have a C compiler: `which cc` or `which gcc`
-- On Solaris/HP-UX, ensure you're linking socket libs: `-lsocket -lnsl`
+- On Solaris, ensure you're linking socket libs: `-lsocket -lnsl`
+- On HP-UX with K&R compiler errors, use `client_kr.c` instead (see above)
 
 **Can't connect:**
 - Verify the relay is running on Linux
@@ -165,6 +187,10 @@ The relay provides these tools to Claude (used automatically):
 **Garbled output:**
 - Use `-s` flag for simple/ASCII mode
 - Ensure your terminal is set to VT100 or compatible
+
+**Programs complain about unknown terminal type:**
+- Set TERM before running curses-based programs: `export TERM=vt100`
+- On HP-UX you can also try: `export TERM=hp`
 
 **Commands not working:**
 - The relay auto-copies the helper to `/tmp/telepresence-helper`
