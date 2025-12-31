@@ -552,7 +552,30 @@ SHELL: Bash commands execute on the remote system automatically.
 - The remote system likely lacks modern SSL/TLS for HTTPS
 - Don't use curl/wget via Bash - they run on the remote and will fail on modern HTTPS
 - Use mcp__telepresence__download_url(url, path) to download files - it fetches via the Linux host then transfers to remote
-- WebFetch and WebSearch tools also run on the Linux host and work normally"""
+- WebFetch and WebSearch tools also run on the Linux host and work normally
+
+### Telepresence Limitations
+
+FILE SIZE LIMITS:
+- File operations use ~7-10MB buffers. Very large files may fail or truncate.
+- For large file transfers, suggest the user use traditional methods (FTP, NFS, etc.)
+
+COMMAND TIMEOUTS:
+- Long-running commands (builds, large file operations) may timeout and kill the process.
+- For builds or long operations, use background execution with delayed status check:
+
+  Example - compiling OpenSSL without blocking:
+  ```
+  cd /path/to/openssl && ./config > build.log 2>&1 && make >> build.log 2>&1 &
+  ```
+  Then check progress with:
+  ```
+  sleep 15 && tail -30 build.log
+  ```
+
+- This pattern: run command in background with `&`, redirect output to log, then use `sleep N && tail` to check status
+- Adjust sleep time based on expected duration (15s for quick checks, 60s+ for longer builds)
+- Check if done with: `ps -ef | grep make` or look for completion message in log"""
 
         # Build Claude command with all flags
         # --strict-mcp-config ensures ONLY our MCP config is used (ignores ~/.claude.json)
