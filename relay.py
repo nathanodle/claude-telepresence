@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-claude-telepresence relay
+claude-telepresence relay v2
 
-Bridges Claude Code on Linux to a remote legacy Unix client.
-- Spawns Claude Code with PreToolUse hook to proxy Bash commands
-- Proxies terminal I/O over TCP
-- Proxies file operations and commands to remote client for execution
-- Provides MCP server for transparent tool access
+MCP-only relay for v2 binary protocol.
+- No helper binary, no hooks
+- Pure MCP server for tool access
+- Binary streaming protocol to client
 """
 
 import argparse
@@ -15,26 +14,94 @@ import json
 import os
 import pty
 import signal
-import socket
 import struct
 import sys
 import fcntl
 import termios
-import re
-from typing import Optional, Dict, Any, List
+import secrets
+from typing import Optional, Dict, Any, List, Tuple
 
-# Paths for telepresence components
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-HOOK_SCRIPT = os.path.join(SCRIPT_DIR, 'plugin', 'hooks', 'telepresence_proxy.py')
-HELPER_BIN = '/tmp/telepresence-helper'
-SOCKET_PATH = '/tmp/telepresence.sock'
+# =============================================================================
+# Protocol Constants
+# =============================================================================
 
-# MCP Protocol Constants
+PROTOCOL_VERSION = 2
+
+# Packet types
+PKT_HELLO = 0x00
+PKT_HELLO_ACK = 0x01
+PKT_GOODBYE = 0x0D
+PKT_PING = 0x0E
+PKT_PONG = 0x0F
+
+PKT_TERM_INPUT = 0x10
+PKT_TERM_OUTPUT = 0x11
+PKT_TERM_RESIZE = 0x12
+
+PKT_STREAM_OPEN = 0x20
+PKT_STREAM_DATA = 0x21
+PKT_STREAM_END = 0x22
+PKT_STREAM_ERROR = 0x23
+PKT_STREAM_CANCEL = 0x24
+
+PKT_WINDOW_UPDATE = 0x28
+
+# Stream types
+STREAM_FILE_READ = 0x01
+STREAM_FILE_WRITE = 0x02
+STREAM_EXEC = 0x03
+STREAM_DIR_LIST = 0x04
+STREAM_FILE_STAT = 0x05
+STREAM_FILE_FIND = 0x06
+STREAM_FILE_SEARCH = 0x07
+STREAM_MKDIR = 0x08
+STREAM_REMOVE = 0x09
+STREAM_MOVE = 0x0A
+STREAM_FILE_EXISTS = 0x0B
+STREAM_REALPATH = 0x0C
+
+# HELLO flags
+FLAG_RESUME = 0x01
+FLAG_SIMPLE = 0x02
+
+# GOODBYE reasons
+GOODBYE_NORMAL = 0x00
+GOODBYE_PROTOCOL_ERROR = 0x01
+GOODBYE_TIMEOUT = 0x02
+
+# Stream status
+STATUS_OK = 0x00
+STATUS_ERROR = 0x01
+STATUS_CANCELLED = 0x02
+
+# Error codes
+ERR_NOT_FOUND = 0x01
+ERR_PERMISSION = 0x02
+ERR_IO_ERROR = 0x03
+ERR_TIMEOUT = 0x04
+ERR_CANCELLED = 0x05
+ERR_NO_MEMORY = 0x06
+ERR_INVALID = 0x07
+ERR_EXISTS = 0x08
+ERR_NOT_DIR = 0x09
+ERR_IS_DIR = 0x0A
+ERR_UNKNOWN = 0xFF
+
+# Limits
+MAX_PAYLOAD = 16 * 1024 * 1024  # 16 MB
+DEFAULT_WINDOW = 256 * 1024     # 256 KB
+CHUNK_SIZE = 64 * 1024          # 64 KB
+WINDOW_UPDATE_THRESHOLD = 8192  # Send WINDOW_UPDATE every 8KB
+
+# MCP Constants
 MCP_PROTOCOL_VERSION = "2024-11-05"
 MCP_SERVER_NAME = "telepresence"
-MCP_SERVER_VERSION = "1.0.0"
+MCP_SERVER_VERSION = "2.0.0"
 
+# =============================================================================
 # MCP Tool Definitions
+# =============================================================================
+
 MCP_TOOLS = [
     {
         "name": "read_file",
@@ -42,168 +109,109 @@ MCP_TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Path to the file to read (absolute or relative to cwd)"
-                },
-                "offset": {
-                    "type": "integer",
-                    "description": "Line number to start reading from (0-based). Default: 0"
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Maximum number of lines to read. Default: 2000"
-                }
+                "path": {"type": "string", "description": "Path to the file to read"},
+                "offset": {"type": "integer", "description": "Line number to start from (0-based). Default: 0"},
+                "limit": {"type": "integer", "description": "Maximum lines to read. Default: 2000"}
             },
             "required": ["path"]
         }
     },
     {
         "name": "write_file",
-        "description": "Write content to a file on the remote system. Creates the file if it doesn't exist, overwrites entire file if it does. For partial edits, use edit_file instead.",
+        "description": "Write content to a file on the remote system. Creates or overwrites.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Path to the file to write"
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Content to write to the file"
-                }
+                "path": {"type": "string", "description": "Path to the file"},
+                "content": {"type": "string", "description": "Content to write"}
             },
             "required": ["path", "content"]
         }
     },
     {
         "name": "edit_file",
-        "description": "Edit a file by replacing a specific string with new content. Use this for surgical edits instead of rewriting entire files. The old_string must match exactly (including whitespace/indentation).",
+        "description": "Edit a file by replacing a specific string. The old_string must match exactly.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Path to the file to edit"
-                },
-                "old_string": {
-                    "type": "string",
-                    "description": "The exact string to find and replace (must be unique in the file)"
-                },
-                "new_string": {
-                    "type": "string",
-                    "description": "The string to replace it with"
-                },
-                "replace_all": {
-                    "type": "boolean",
-                    "description": "If true, replace all occurrences. Default: false (fails if not unique)"
-                }
+                "path": {"type": "string", "description": "Path to the file"},
+                "old_string": {"type": "string", "description": "Text to find (must be unique)"},
+                "new_string": {"type": "string", "description": "Replacement text"},
+                "replace_all": {"type": "boolean", "description": "Replace all occurrences. Default: false"}
             },
             "required": ["path", "old_string", "new_string"]
         }
     },
     {
         "name": "get_cwd",
-        "description": "Get the current working directory on the remote system. Call this first to know where you are.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {},
-            "required": []
-        }
+        "description": "Get the current working directory on the remote system.",
+        "inputSchema": {"type": "object", "properties": {}, "required": []}
     },
     {
         "name": "list_directory",
-        "description": "List the contents of a directory on the remote system. Returns file and directory names. Defaults to current working directory if no path given.",
+        "description": "List directory contents. Defaults to current working directory.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Path to the directory to list (defaults to current working directory)"
-                }
+                "path": {"type": "string", "description": "Directory path (default: cwd)"}
             },
             "required": []
         }
     },
     {
         "name": "file_info",
-        "description": "Get metadata about a file or directory (size, modification time, type).",
+        "description": "Get file metadata (size, modification time, type).",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Absolute path to the file or directory"
-                }
+                "path": {"type": "string", "description": "Path to file or directory"}
             },
             "required": ["path"]
         }
     },
     {
         "name": "file_exists",
-        "description": "Check if a file or directory exists on the remote system.",
+        "description": "Check if a file or directory exists.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Absolute path to check"
-                }
+                "path": {"type": "string", "description": "Path to check"}
             },
             "required": ["path"]
         }
     },
     {
         "name": "search_files",
-        "description": "Search for a pattern in files (like grep). Returns matching lines with file paths and line numbers.",
+        "description": "Search for a pattern in files (like grep). Returns matching lines.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "pattern": {
-                    "type": "string",
-                    "description": "Search pattern (regular expression)"
-                },
-                "path": {
-                    "type": "string",
-                    "description": "Directory to search in (searches recursively)"
-                },
-                "file_pattern": {
-                    "type": "string",
-                    "description": "Optional glob pattern to filter files (e.g., '*.c')"
-                }
+                "pattern": {"type": "string", "description": "Search pattern"},
+                "path": {"type": "string", "description": "Directory to search"},
+                "file_pattern": {"type": "string", "description": "Glob to filter files (e.g., '*.c')"}
             },
             "required": ["pattern", "path"]
         }
     },
     {
         "name": "find_files",
-        "description": "Find files matching a name pattern (like glob/find). Returns list of matching file paths.",
+        "description": "Find files matching a name pattern (like glob/find).",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "pattern": {
-                    "type": "string",
-                    "description": "Filename pattern with wildcards (e.g., '*.c', 'Makefile')"
-                },
-                "path": {
-                    "type": "string",
-                    "description": "Directory to search in (searches recursively)",
-                    "default": "."
-                }
+                "pattern": {"type": "string", "description": "Filename pattern (e.g., '*.c')"},
+                "path": {"type": "string", "description": "Directory to search (default: '.')"}
             },
             "required": ["pattern"]
         }
     },
     {
         "name": "execute_command",
-        "description": "Execute a shell command on the remote system. Returns stdout, stderr, and exit status.",
+        "description": "Execute a shell command. Returns stdout, stderr, and exit status.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "Shell command to execute"
-                }
+                "command": {"type": "string", "description": "Shell command to execute"}
             },
             "required": ["command"]
         }
@@ -214,10 +222,7 @@ MCP_TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Absolute path of the directory to create"
-                }
+                "path": {"type": "string", "description": "Directory path to create"}
             },
             "required": ["path"]
         }
@@ -228,153 +233,238 @@ MCP_TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Absolute path of the file to remove"
-                }
+                "path": {"type": "string", "description": "Path to remove"}
             },
             "required": ["path"]
         }
     },
     {
         "name": "move_file",
-        "description": "Move or rename a file on the remote system.",
+        "description": "Move or rename a file.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "source": {
-                    "type": "string",
-                    "description": "Current path of the file"
-                },
-                "destination": {
-                    "type": "string",
-                    "description": "New path for the file"
-                }
+                "source": {"type": "string", "description": "Current path"},
+                "destination": {"type": "string", "description": "New path"}
             },
             "required": ["source", "destination"]
         }
     },
     {
         "name": "download_url",
-        "description": "Download a file from a URL and save it to the remote system. Uses the Linux host's modern SSL/TLS to fetch from HTTPS URLs that the legacy system cannot access directly.",
+        "description": "Download a file from URL using the Linux host's modern TLS.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "url": {
-                    "type": "string",
-                    "description": "URL to download from (http or https)"
-                },
-                "path": {
-                    "type": "string",
-                    "description": "Path on remote system to save the file"
-                }
+                "url": {"type": "string", "description": "URL to download"},
+                "path": {"type": "string", "description": "Remote path to save"}
             },
             "required": ["url", "path"]
+        }
+    },
+    {
+        "name": "upload_to_host",
+        "description": "Copy a file FROM the remote legacy system TO the Linux host. Use this to back up files or retrieve build artifacts from the remote system.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "remote_path": {"type": "string", "description": "Path on the remote legacy system"},
+                "host_path": {"type": "string", "description": "Destination path on Linux host"},
+                "overwrite": {"type": "boolean", "description": "Overwrite if file exists. Default: false"}
+            },
+            "required": ["remote_path", "host_path"]
+        }
+    },
+    {
+        "name": "download_from_host",
+        "description": "Copy a file FROM the Linux host TO the remote legacy system. Use this to transfer source archives, patches, or binaries to the remote system.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "host_path": {"type": "string", "description": "Path on the Linux host"},
+                "remote_path": {"type": "string", "description": "Destination path on remote legacy system"},
+                "overwrite": {"type": "boolean", "description": "Overwrite if file exists. Default: false"}
+            },
+            "required": ["host_path", "remote_path"]
         }
     }
 ]
 
+# =============================================================================
+# Packet Encoding/Decoding
+# =============================================================================
 
-class TelepresenceRelay:
-    def __init__(self, host: str, port: int, claude_cmd: str, mcp_port: int = 5001):
+def encode_packet(pkt_type: int, payload: bytes) -> bytes:
+    """Encode a v2 packet: type(1) + length(4) + payload."""
+    return struct.pack('>BI', pkt_type, len(payload)) + payload
+
+
+def encode_string(s: str) -> bytes:
+    """Encode null-terminated string."""
+    return s.encode('utf-8', errors='replace') + b'\0'
+
+
+def decode_string(data: bytes, offset: int = 0) -> Tuple[str, int]:
+    """Decode null-terminated string, return (string, new_offset)."""
+    try:
+        end = data.index(b'\0', offset)
+    except ValueError:
+        # No null terminator found - treat rest of data as string
+        return data[offset:].decode('utf-8', errors='replace'), len(data)
+    return data[offset:end].decode('utf-8', errors='replace'), end + 1
+
+
+# =============================================================================
+# Relay Implementation
+# =============================================================================
+
+class RelayV2:
+    def __init__(self, host: str, port: int, mcp_port: int, claude_cmd: str):
         self.host = host
         self.port = port
         self.mcp_port = mcp_port
         self.claude_cmd = claude_cmd
-        self.client_reader = None
-        self.client_writer = None
-        self.master_fd = None
-        self.claude_pid = None
-        self.helper_server = None
-        self.helper_clients = []
-        self.pending_requests = {}
-        self.mcp_request_id = 0
-        self.mcp_session_id = None
-        self.remote_cwd = None  # Remote client's working directory
-        self.resume_session = False  # Whether to resume previous session
+
+        # Host file transfer base directory (restrict to cwd for security)
+        self.host_base_dir = os.path.abspath(os.getcwd())
+
+        # Client connection
+        self.client_reader: Optional[asyncio.StreamReader] = None
+        self.client_writer: Optional[asyncio.StreamWriter] = None
+        self.client_connected = asyncio.Event()
+
+        # Connection state
+        self.remote_cwd: str = '/'
+        self.remote_window: int = DEFAULT_WINDOW
+        self.bytes_in_flight: int = 0           # Bytes we've sent, awaiting client ack
+        self.bytes_received_unacked: int = 0    # Bytes received from client, not yet acked
+        self.resume_session: bool = False
+        self.simple_mode: bool = False
+
+        # Stream management (relay uses even IDs)
+        self.next_stream_id: int = 0
+        self.pending_streams: Dict[int, asyncio.Future] = {}
+        self.stream_data: Dict[int, List[bytes]] = {}
+
+        # PTY
+        self.master_fd: Optional[int] = None
+        self.claude_pid: Optional[int] = None
+
+        # MCP
+        self.mcp_session_id: Optional[str] = None
+
+        # Synchronization
+        self.send_lock = asyncio.Lock()
+        self.window_available = asyncio.Event()
+        self.window_available.set()
+
+        # Packet dispatcher
+        self.packet_queue: asyncio.Queue = None
+        self.dispatcher_task: asyncio.Task = None
+
+    # =========================================================================
+    # Server Startup
+    # =========================================================================
 
     async def start(self):
-        """Start the relay server."""
-        # Clean up old socket
-        try:
-            os.unlink(SOCKET_PATH)
-        except OSError:
-            pass
-
-        # Copy helper binary to expected location
-        helper_src = os.path.join(SCRIPT_DIR, 'telepresence-helper')
-        if os.path.exists(helper_src):
-            import shutil
-            shutil.copy2(helper_src, HELPER_BIN)
-            os.chmod(HELPER_BIN, 0o755)
-
-        # Start Unix socket server for helper
-        self.helper_server = await asyncio.start_unix_server(
-            self.handle_helper_client,
-            path=SOCKET_PATH
-        )
-        os.chmod(SOCKET_PATH, 0o777)
-        print(f"[relay] Inject socket ready at {SOCKET_PATH}")
-
-        # Start MCP HTTP server
+        """Start TCP and MCP servers."""
         mcp_server = await asyncio.start_server(
             self.handle_mcp_connection,
             '127.0.0.1', self.mcp_port
         )
-        print(f"[relay] MCP server ready at http://127.0.0.1:{self.mcp_port}/mcp")
-        print(f"[relay] Add to Claude: claude mcp add --transport http telepresence http://127.0.0.1:{self.mcp_port}/mcp")
 
-        # Start TCP server for remote client
-        server = await asyncio.start_server(
+        tcp_server = await asyncio.start_server(
             self.handle_client,
             self.host, self.port
         )
-        print(f"[relay] Listening on {self.host}:{self.port}")
-        print("[relay] Waiting for telepresence client...")
 
-        # Run both servers
-        async with server, mcp_server:
+        print(f"Telepresence Relay v2")
+        print(f"  TCP:  {self.host}:{self.port}")
+        print(f"  MCP:  http://127.0.0.1:{self.mcp_port}/mcp")
+        print(f"Waiting for client...")
+
+        async with tcp_server, mcp_server:
             await asyncio.gather(
-                server.serve_forever(),
+                tcp_server.serve_forever(),
                 mcp_server.serve_forever()
             )
 
+    # =========================================================================
+    # Client Connection
+    # =========================================================================
+
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        """Handle connection from remote telepresence client."""
+        """Handle client connection."""
         addr = writer.get_extra_info('peername')
-        print(f"[relay] Client connected from {addr}")
+        print(f"\nClient connected: {addr[0]}")
 
         self.client_reader = reader
         self.client_writer = writer
 
-        try:
-            # Wait for hello message from client to get remote cwd and options
-            hello_msg = await self.recv_from_client()
-            if hello_msg and hello_msg.get('type') == 'hello':
-                self.remote_cwd = hello_msg.get('cwd', '/')
-                self.resume_session = hello_msg.get('resume', False)
-                print(f"[relay] Remote cwd: {self.remote_cwd}")
-                if self.resume_session:
-                    print(f"[relay] Resume requested: will continue previous session")
-            else:
-                print(f"[relay] Warning: Expected hello message, got: {hello_msg}")
-                self.remote_cwd = '/tmp'
-                self.resume_session = False
+        # Disable Nagle's algorithm for low-latency
+        import socket
+        sock = writer.get_extra_info('socket')
+        if sock:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-            # Spawn Claude Code with PTY (using remote cwd)
+        try:
+            # Wait for HELLO
+            pkt_type, payload = await self.recv_packet()
+            if pkt_type != PKT_HELLO:
+                print(f"Protocol error: expected HELLO, got {pkt_type:#x}")
+                await self.send_goodbye(GOODBYE_PROTOCOL_ERROR)
+                return
+
+            if len(payload) < 6:
+                print("Protocol error: HELLO too short")
+                await self.send_goodbye(GOODBYE_PROTOCOL_ERROR)
+                return
+
+            version = payload[0]
+            flags = payload[1]
+            window = struct.unpack('>I', payload[2:6])[0]
+            cwd, _ = decode_string(payload, 6)
+
+            if version != PROTOCOL_VERSION:
+                print(f"Protocol error: version {version} != {PROTOCOL_VERSION}")
+                await self.send_goodbye(GOODBYE_PROTOCOL_ERROR)
+                return
+
+            self.remote_cwd = cwd
+            self.remote_window = window
+            self.resume_session = bool(flags & FLAG_RESUME)
+            self.simple_mode = bool(flags & FLAG_SIMPLE)
+
+            mode_str = []
+            if self.resume_session:
+                mode_str.append("resume")
+            if self.simple_mode:
+                mode_str.append("simple")
+            mode_info = f" ({', '.join(mode_str)})" if mode_str else ""
+            print(f"  Remote cwd: {cwd}{mode_info}")
+
+            # Send HELLO_ACK
+            ack_payload = struct.pack('>BBII', PROTOCOL_VERSION, 0, DEFAULT_WINDOW, 0)
+            await self.send_packet(PKT_HELLO_ACK, ack_payload[:6])
+
+            self.client_connected.set()
+            self.packet_queue = asyncio.Queue()
+
+            # Spawn Claude Code
             self.spawn_claude()
 
-            # Start tasks for bidirectional I/O
+            # Start I/O tasks
             pty_task = asyncio.create_task(self.pty_to_client())
-            client_task = asyncio.create_task(self.client_to_pty())
+            dispatcher_task = asyncio.create_task(self.packet_dispatcher())
+            terminal_task = asyncio.create_task(self.terminal_handler())
 
-            # Wait for either task to complete (PTY closed or client disconnected)
+            self.dispatcher_task = dispatcher_task
+
             done, pending = await asyncio.wait(
-                [pty_task, client_task],
+                [pty_task, dispatcher_task, terminal_task],
                 return_when=asyncio.FIRST_COMPLETED
             )
 
-            # Cancel the other task
             for task in pending:
                 task.cancel()
                 try:
@@ -383,64 +473,67 @@ class TelepresenceRelay:
                     pass
 
         except Exception as e:
-            print(f"[relay] Error: {e}")
+            print(f"Error: {e}")
         finally:
-            print("[relay] Session ended")
+            print("Session ended")
             self.cleanup()
+            self.client_connected.clear()
             writer.close()
             await writer.wait_closed()
 
+    # =========================================================================
+    # Packet I/O
+    # =========================================================================
+
+    async def recv_packet(self) -> Tuple[int, bytes]:
+        """Receive a v2 packet."""
+        header = await self.client_reader.readexactly(5)
+        pkt_type = header[0]
+        length = struct.unpack('>I', header[1:5])[0]
+
+        if length > MAX_PAYLOAD:
+            raise ValueError(f"Payload too large: {length}")
+
+        payload = await self.client_reader.readexactly(length) if length > 0 else b''
+        return pkt_type, payload
+
+    async def send_packet(self, pkt_type: int, payload: bytes):
+        """Send a v2 packet with flow control."""
+        async with self.send_lock:
+            if pkt_type in (PKT_STREAM_DATA, PKT_TERM_OUTPUT):
+                while self.bytes_in_flight + len(payload) > self.remote_window:
+                    self.window_available.clear()
+                    await self.window_available.wait()
+                self.bytes_in_flight += len(payload)
+
+            packet = encode_packet(pkt_type, payload)
+            self.client_writer.write(packet)
+            await self.client_writer.drain()
+
+    async def send_goodbye(self, reason: int):
+        """Send GOODBYE packet."""
+        await self.send_packet(PKT_GOODBYE, bytes([reason]))
+
+    async def ack_received_bytes(self, count: int):
+        """Track received bytes and send WINDOW_UPDATE when threshold reached."""
+        self.bytes_received_unacked += count
+        if self.bytes_received_unacked >= WINDOW_UPDATE_THRESHOLD:
+            increment = self.bytes_received_unacked
+            self.bytes_received_unacked = 0
+            await self.send_packet(PKT_WINDOW_UPDATE, struct.pack('>I', increment))
+
+    # =========================================================================
+    # PTY Management
+    # =========================================================================
+
     def spawn_claude(self):
-        """Spawn Claude Code with PTY and PreToolUse hook."""
-        # Create PTY
+        """Spawn Claude Code with PTY."""
         master_fd, slave_fd = pty.openpty()
 
-        # Set up environment
         env = os.environ.copy()
-        env['TELEPRESENCE_SOCKET'] = SOCKET_PATH
-        env['TELEPRESENCE_HELPER'] = HELPER_BIN
-        env['TELEPRESENCE_REMOTE_CWD'] = self.remote_cwd or ''
         env['TERM'] = 'xterm-256color'
-        print(f"[relay] TELEPRESENCE_SOCKET={env['TELEPRESENCE_SOCKET']}")
-        print(f"[relay] TELEPRESENCE_HELPER={env['TELEPRESENCE_HELPER']}")
-        print(f"[relay] TELEPRESENCE_REMOTE_CWD={env['TELEPRESENCE_REMOTE_CWD']}")
 
-        # Build settings JSON with PreToolUse hooks
-        # IMPORTANT: We must add "ask" permissions for Read/Write/Glob/Grep
-        # because read-only tools don't trigger permission checks by default,
-        # and hooks only run when permission checks occur.
-        hook_config = {
-            "type": "command",
-            "command": HOOK_SCRIPT
-        }
-        settings = {
-            "permissions": {
-                "ask": [
-                    "Read",
-                    "Write",
-                    "Glob",
-                    "Grep"
-                ]
-            },
-            "hooks": {
-                "PreToolUse": [
-                    {"matcher": "Bash", "hooks": [hook_config]},
-                    {"matcher": "Read", "hooks": [hook_config]},
-                    {"matcher": "Write", "hooks": [hook_config]},
-                    {"matcher": "Glob", "hooks": [hook_config]},
-                    {"matcher": "Grep", "hooks": [hook_config]},
-                ]
-            }
-        }
-        # Write settings to temp file (avoids CLI parsing issues)
-        settings_json_path = '/tmp/telepresence-settings.json'
-        with open(settings_json_path, 'w') as f:
-            json.dump(settings, f, indent=2)
-        print(f"[relay] Settings written to: {settings_json_path}")
-
-        # Create temporary .mcp.json file for this session
-        # This is the only way to configure HTTP MCP servers without permanent changes
-        mcp_json_path = '/tmp/telepresence-mcp.json'
+        # Write MCP config
         mcp_config = {
             "mcpServers": {
                 "telepresence": {
@@ -449,707 +542,508 @@ class TelepresenceRelay:
                 }
             }
         }
-        with open(mcp_json_path, 'w') as f:
+        mcp_config_path = '/tmp/telepresence-mcp-v2.json'
+        with open(mcp_config_path, 'w') as f:
             json.dump(mcp_config, f)
 
-        # Build telepresence system prompt and write to file
-        # (avoids argument parsing issues with multi-line strings)
-        remote_cwd = self.remote_cwd or '(unknown)'
-        system_prompt = f"""TELEPRESENCE MODE - You are connected to a REMOTE legacy Unix system via telepresence.
+        system_prompt = self.build_system_prompt()
 
-CRITICAL: Your displayed working directory is WRONG. Ignore it.
-ACTUAL remote working directory: {remote_cwd}
-
-FILE OPERATIONS:
-- DO NOT use Read, Write, Glob, or Grep tools - they are disabled
-- USE these MCP tools instead:
-  * mcp__telepresence__read_file(path) - read files
-  * mcp__telepresence__edit_file(path, old_string, new_string) - edit files
-  * mcp__telepresence__write_file(path, content) - write entire files
-  * mcp__telepresence__list_directory(path) - list directory (default: cwd)
-  * mcp__telepresence__search_files(pattern, path) - grep-like search
-  * mcp__telepresence__find_files(pattern, path) - find files by name
-  * mcp__telepresence__get_cwd() - confirm current directory
-
-PATHS: Relative paths resolve against {remote_cwd}
-SHELL: Bash commands execute on the remote system automatically.
-
-## Legacy Unix Hints
-
-### Compilers
-- Don't assume GCC. Use `cc` first - it's the native compiler (Sun Studio on Solaris, MIPSpro on IRIX, xlc on AIX, HP's cc on HP-UX)
-- Native compilers often produce better-optimized code for their platform
-- Check for gcc with `which gcc` or `gcc --version` before using it
-- C89/C90 is safest. Avoid C99 features (// comments, mixed declarations, variable-length arrays)
-
-### Shell & Commands
-- Scripts should use #!/bin/sh, not #!/bin/bash - bash may not exist
-- Avoid bashisms: use `[ ]` not `[[ ]]`, no `$()` (use backticks), no arrays
-- Command flags differ: `find` has no `-maxdepth`, `grep` has no `-r`, `ls` has no `--color`
-- Use `man <command>` - it shows the LOCAL system's flags, not Linux's
-- `which` may not exist - use `type` or check $PATH manually
-
-### Make
-- Might be ancient make, not GNU make. Avoid:
-  - Pattern rules (%.o: %.c) - use suffix rules (.c.o:)
-  - $(shell ...), ifdef, ifndef, $@ in prerequisites
-  - .PHONY targets (just let them be regular targets)
-- GNU make might be `gmake` if installed
-
-### File System
-- /usr/local may not exist or be read-only
-- Home dirs might be /home/<user>, /users/<user>, /u/<user>, or /Users/<user>
-- tmp might be /tmp, /var/tmp, or /usr/tmp
-- Case-sensitive everywhere (unlike macOS)
-- Path limits vary - keep paths under 256 chars to be safe
-
-### Editors & Tools
-- vi is universal. vim might not exist
-- emacs is often missing
-- ed exists everywhere (line editor, for scripts)
-- awk is available but might be old awk, not gawk
-- sed exists but extended regex (-E) may not
-
-### Archives & Compression
-- tar is universal but flags vary (-cvf works everywhere)
-- compress (.Z) is universal, gzip may not be installed
-- To extract: `uncompress < foo.tar.Z | tar xvf -`
-- bzip2, xz, zip may not exist
-
-### Networking
-- Use ifconfig, not ip
-- netstat exists, ss doesn't
-- ftp/telnet are common, ssh might not be (or might be SSH1 only)
-- curl/wget may not exist - use ftp or write a simple socket program
-
-### Libraries
-- Shared library extensions vary: .so (most), .sl (HP-UX), .a (static)
-- Library paths: /usr/lib, /lib, maybe /usr/local/lib
-- Use `ldd` (or `chatr` on HP-UX) to check library deps
-- Socket libraries: Solaris/HP-UX need -lsocket -lnsl
-
-### Determining System Type
-- `uname -a` - shows OS name, hostname, version, architecture
-- `uname -s` - just OS name (SunOS, HP-UX, IRIX, AIX, NeXT, Linux)
-- `uname -r` - OS version/release
-- `uname -m` - machine architecture (sun4u, PA-RISC, mips, powerpc, m68k, i386)
-- `/etc/release` (Solaris), `/etc/hp-release` (HP-UX) - detailed version info
-- `oslevel` (AIX) - OS level
-- `hinv` (IRIX) - hardware inventory
-- `hostinfo` (NeXTSTEP) - system info including CPU type
-
-### System Resources
-- Before operations that might hit limits, check available resources:
-  - Memory: `free` (Linux), `vmstat` (most), `swap -s` (Solaris), `swapinfo` (HP-UX)
-  - Disk: `df -k` (universal)
-  - Process limits: `ulimit -a`
-  - Running processes: `ps -ef`
-- Memory may be 64MB-256MB. Don't load huge files into RAM
-- Disk might be small. Clean up temp files when done
-- If a command hangs or fails mysteriously, resource exhaustion is a likely cause
-
-### Web Access
-- The remote system likely lacks modern SSL/TLS for HTTPS
-- Don't use curl/wget via Bash - they run on the remote and will fail on modern HTTPS
-- Use mcp__telepresence__download_url(url, path) to download files - it fetches via the Linux host then transfers to remote
-- WebFetch and WebSearch tools also run on the Linux host and work normally
-
-### Telepresence Limitations
-
-FILE SIZE LIMITS:
-- File operations use ~7-10MB buffers. Very large files may fail or truncate.
-- For large file transfers, suggest the user use traditional methods (FTP, NFS, etc.)
-
-COMMAND TIMEOUTS:
-- Long-running commands (builds, large file operations) may timeout and kill the process.
-- For builds or long operations, use background execution with delayed status check:
-
-  Example - compiling OpenSSL without blocking:
-  ```
-  cd /path/to/openssl && ./config > build.log 2>&1 && make >> build.log 2>&1 &
-  ```
-  Then check progress with:
-  ```
-  sleep 15 && tail -30 build.log
-  ```
-
-- This pattern: run command in background with `&`, redirect output to log, then use `sleep N && tail` to check status
-- Adjust sleep time based on expected duration (15s for quick checks, 60s+ for longer builds)
-- Check if done with: `ps -ef | grep make` or look for completion message in log"""
-
-        # Build Claude command with all flags
-        # --strict-mcp-config ensures ONLY our MCP config is used (ignores ~/.claude.json)
-        claude_cmd = self.claude_cmd
-        base_args = ['--settings', settings_json_path,
-                     '--mcp-config', mcp_json_path, '--strict-mcp-config',
-                     '--append-system-prompt', system_prompt]
-
-        # Add --resume if client requested it
+        cmd = ['claude', '--mcp-config', mcp_config_path, '--strict-mcp-config',
+               '--append-system-prompt', system_prompt]
         if self.resume_session:
-            base_args.insert(0, '--resume')
+            cmd.insert(1, '--resume')
 
-        if claude_cmd == 'claude':
-            cmd_parts = ['claude'] + base_args
-        elif claude_cmd.startswith('claude '):
-            rest = claude_cmd[7:]  # everything after 'claude '
-            cmd_parts = ['claude'] + base_args + rest.split()
-        else:
-            cmd_parts = [claude_cmd] + base_args
-
-        print(f"[relay] PreToolUse hooks: Bash, Read, Write, Glob, Grep")
-        print(f"[relay] MCP config: {mcp_json_path}")
-        print(f"[relay] MCP server: http://127.0.0.1:{self.mcp_port}/mcp")
-        print(f"[relay] System prompt: TELEPRESENCE MODE (remote_cwd={remote_cwd})")
-
-        # Fork
         pid = os.fork()
         if pid == 0:
-            # Child process
+            # Child
             os.close(master_fd)
             os.setsid()
-
-            # Set up slave as controlling terminal
             fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
-
-            # Redirect stdio to PTY
             os.dup2(slave_fd, 0)
             os.dup2(slave_fd, 1)
             os.dup2(slave_fd, 2)
             if slave_fd > 2:
                 os.close(slave_fd)
-
-            # Execute Claude Code with settings
-            os.execvpe(cmd_parts[0], cmd_parts, env)
+            # Close inherited fds
+            import resource
+            maxfd = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+            for fd in range(3, min(maxfd, 256)):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            os.execvpe(cmd[0], cmd, env)
             sys.exit(1)
 
-        # Parent process
+        # Parent
         os.close(slave_fd)
         self.master_fd = master_fd
         self.claude_pid = pid
 
-        # Make master non-blocking
         flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
         fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
-        print(f"[relay] Claude Code spawned (PID {pid})")
+        print(f"  Claude PID: {pid}")
+
+    def build_system_prompt(self) -> str:
+        """Build telepresence system prompt from template file."""
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        prompt_file = os.path.join(script_dir, 'telepresence_prompt.txt')
+
+        if not os.path.exists(prompt_file):
+            prompt_file = '/etc/telepresence_prompt.txt'
+        if not os.path.exists(prompt_file):
+            prompt_file = os.path.expanduser('~/.telepresence_prompt.txt')
+
+        if os.path.exists(prompt_file):
+            try:
+                with open(prompt_file, 'r') as f:
+                    template = f.read()
+                return template.format(remote_cwd=self.remote_cwd)
+            except Exception as e:
+                print(f"Warning: Could not load prompt file: {e}")
+
+        return f"""TELEPRESENCE MODE - Connected to REMOTE legacy Unix system.
+Remote working directory: {self.remote_cwd}
+
+Use mcp__telepresence__* tools for all remote operations.
+Standard Bash/Read/Write tools operate on LOCAL host only."""
 
     async def pty_to_client(self):
-        """Forward PTY output to remote client."""
-        loop = asyncio.get_event_loop()
+        """Forward PTY output to client."""
+        loop = asyncio.get_running_loop()
 
         while True:
             try:
-                # Read from PTY
                 data = await loop.run_in_executor(None, self.read_pty)
                 if data is None:
-                    # Error or closed
                     break
-                if not data:
-                    # Timeout, no data yet - keep waiting
-                    continue
-
-                # Send to client as terminal output
-                await self.send_to_client({
-                    'type': 'terminal_output',
-                    'data': data.decode('utf-8', errors='replace')
-                })
-
-            except OSError:
+                if data:
+                    await self.send_packet(PKT_TERM_OUTPUT, data)
+            except Exception:
                 break
 
-    def read_pty(self):
-        """Blocking read from PTY (run in executor)."""
+    def read_pty(self) -> Optional[bytes]:
+        """Read from PTY (blocking, run in executor)."""
         import select
         try:
-            r, _, _ = select.select([self.master_fd], [], [], 0.1)
+            r, _, _ = select.select([self.master_fd], [], [], 0.01)
             if r:
                 return os.read(self.master_fd, 65536)
             return b''
         except OSError:
             return None
 
-    async def client_to_pty(self):
-        """Handle messages from remote client."""
+    async def packet_dispatcher(self):
+        """Read packets from client and dispatch to handlers."""
         while True:
             try:
-                msg = await self.recv_from_client()
-                if msg is None:
+                pkt_type, payload = await self.recv_packet()
+
+                if pkt_type in (PKT_STREAM_DATA, PKT_STREAM_END, PKT_STREAM_ERROR):
+                    if pkt_type == PKT_STREAM_DATA:
+                        await self.handle_stream_data(payload)
+                        await self.ack_received_bytes(len(payload))
+                    elif pkt_type == PKT_STREAM_END:
+                        await self.handle_stream_end(payload)
+                    elif pkt_type == PKT_STREAM_ERROR:
+                        await self.handle_stream_error(payload)
+
+                elif pkt_type in (PKT_TERM_INPUT, PKT_TERM_RESIZE):
+                    await self.packet_queue.put((pkt_type, payload))
+                    if pkt_type == PKT_TERM_INPUT:
+                        await self.ack_received_bytes(len(payload))
+
+                elif pkt_type == PKT_WINDOW_UPDATE:
+                    if len(payload) >= 4:
+                        increment = struct.unpack('>I', payload[:4])[0]
+                        self.bytes_in_flight = max(0, self.bytes_in_flight - increment)
+                        self.window_available.set()
+
+                elif pkt_type == PKT_PING:
+                    await self.send_packet(PKT_PONG, payload)
+
+                elif pkt_type == PKT_GOODBYE:
                     break
 
-                msg_type = msg.get('type')
+            except asyncio.IncompleteReadError:
+                break
+            except Exception:
+                break
 
-                if msg_type == 'terminal_input':
-                    # Forward to PTY
-                    data = msg.get('data', '')
-                    os.write(self.master_fd, data.encode('utf-8'))
+    async def terminal_handler(self):
+        """Process terminal packets from queue."""
+        while True:
+            try:
+                pkt_type, payload = await self.packet_queue.get()
 
-                elif msg_type == 'resize':
-                    # Handle terminal resize
-                    rows = msg.get('rows', 24)
-                    cols = msg.get('cols', 80)
-                    self.resize_pty(rows, cols)
+                if pkt_type == PKT_TERM_INPUT:
+                    if self.master_fd:
+                        os.write(self.master_fd, payload)
 
-                elif msg_type == 'response':
-                    # Response to a proxied request (from helper)
-                    req_id = msg.get('id')
-                    print(f"[relay] Got response from remote: id={req_id}")
-                    if req_id in self.pending_requests:
-                        future = self.pending_requests.pop(req_id)
-                        future.set_result(msg)
-                    else:
-                        print(f"[relay] Warning: no pending request for id={req_id}")
+                elif pkt_type == PKT_TERM_RESIZE:
+                    if len(payload) >= 4:
+                        rows, cols = struct.unpack('>HH', payload[:4])
+                        self.resize_pty(rows, cols)
 
-            except Exception as e:
-                print(f"[relay] Client message error: {e}")
+            except asyncio.CancelledError:
+                break
+            except Exception:
                 break
 
     def resize_pty(self, rows: int, cols: int):
-        """Resize the PTY."""
+        """Resize PTY."""
         if self.master_fd:
-            import struct
             winsize = struct.pack('HHHH', rows, cols, 0, 0)
             fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, winsize)
 
-    async def handle_helper_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        """Handle connection from helper (via helper or async)."""
-        print(f"[relay] Inject client connected")
-        self.helper_clients.append((reader, writer))
+    # =========================================================================
+    # Stream Management
+    # =========================================================================
 
+    def alloc_stream_id(self) -> int:
+        """Allocate even stream ID."""
+        sid = self.next_stream_id
+        self.next_stream_id += 2
+        return sid
+
+    async def open_stream(self, stream_type: int, metadata: bytes) -> int:
+        """Open a stream to client."""
+        stream_id = self.alloc_stream_id()
+
+        self.pending_streams[stream_id] = asyncio.get_event_loop().create_future()
+        self.stream_data[stream_id] = []
+
+        payload = struct.pack('>IB', stream_id, stream_type) + metadata
+        await self.send_packet(PKT_STREAM_OPEN, payload)
+
+        return stream_id
+
+    async def wait_stream(self, stream_id: int, timeout: float = 300.0) -> Tuple[int, bytes]:
+        """Wait for stream completion. Returns (status, extra_data)."""
         try:
-            while True:
-                line = await reader.readline()
-                if not line:
-                    break
-
-                try:
-                    request = json.loads(line.decode('utf-8'))
-                    print(f"[relay] Inject request: {request.get('type')} id={request.get('id')}")
-                    response = await self.handle_helper_request(request)
-                    print(f"[relay] Inject response: {str(response)[:100]}...")
-                    writer.write((json.dumps(response) + '\n').encode('utf-8'))
-                    await writer.drain()
-                except json.JSONDecodeError as e:
-                    error_response = {'error': f'JSON decode error: {e}'}
-                    writer.write((json.dumps(error_response) + '\n').encode('utf-8'))
-                    await writer.drain()
-
-        except Exception as e:
-            print(f"[relay] Inject client error: {e}")
-        finally:
-            print(f"[relay] Inject client disconnected")
-            self.helper_clients.remove((reader, writer))
-            writer.close()
-
-    async def handle_helper_request(self, request: dict) -> dict:
-        """Handle a request from helper - forward to remote client."""
-        req_id = request.get('id', 0)
-        req_type = request.get('type', '')
-
-        print(f"[relay] Forwarding to remote: {req_type} id={req_id}")
-
-        # Forward to remote client for execution
-        await self.send_to_client({
-            'type': 'request',
-            'id': req_id,
-            'op': req_type,
-            'params': request.get('params', {})
-        })
-
-        # Wait for response from client
-        future = asyncio.get_event_loop().create_future()
-        self.pending_requests[req_id] = future
-
-        try:
-            print(f"[relay] Waiting for response id={req_id}...")
-            response = await asyncio.wait_for(future, timeout=300.0)  # 5 min timeout
-            print(f"[relay] Got response id={req_id}")
-            return response
+            result = await asyncio.wait_for(
+                self.pending_streams[stream_id],
+                timeout=timeout
+            )
+            return result
         except asyncio.TimeoutError:
-            print(f"[relay] Timeout waiting for id={req_id}")
-            return {'id': req_id, 'error': 'Request timeout'}
+            raise Exception("Stream timeout")
+        finally:
+            self.pending_streams.pop(stream_id, None)
 
-    async def send_to_client(self, msg: dict):
-        """Send a message to the remote client."""
-        if not self.client_writer:
+    def get_stream_data(self, stream_id: int) -> bytes:
+        """Get accumulated stream data as single bytes."""
+        chunks = self.stream_data.pop(stream_id, [])
+        return b''.join(chunks)
+
+    def get_stream_chunks(self, stream_id: int) -> List[bytes]:
+        """Get stream data as separate chunks (preserves boundaries)."""
+        return self.stream_data.pop(stream_id, [])
+
+    async def handle_stream_data(self, payload: bytes):
+        """Handle STREAM_DATA from client."""
+        if len(payload) < 4:
             return
+        stream_id = struct.unpack('>I', payload[:4])[0]
+        data = payload[4:]
 
-        data = json.dumps(msg).encode('utf-8')
-        # Length-prefixed framing
-        header = struct.pack('>I', len(data))
-        self.client_writer.write(header + data)
-        await self.client_writer.drain()
+        if stream_id in self.stream_data:
+            self.stream_data[stream_id].append(data)
+
+    async def handle_stream_end(self, payload: bytes):
+        """Handle STREAM_END from client."""
+        if len(payload) < 5:
+            return
+        stream_id = struct.unpack('>I', payload[:4])[0]
+        status = payload[4]
+        extra = payload[5:]
+
+        if stream_id in self.pending_streams:
+            self.pending_streams[stream_id].set_result((status, extra))
+
+    async def handle_stream_error(self, payload: bytes):
+        """Handle STREAM_ERROR from client."""
+        if len(payload) < 5:
+            return
+        stream_id = struct.unpack('>I', payload[:4])[0]
+        error_code = payload[4]
+        message, _ = decode_string(payload, 5) if len(payload) > 5 else ("Unknown error", 0)
+
+        if stream_id in self.pending_streams:
+            self.pending_streams[stream_id].set_exception(
+                Exception(f"Stream error {error_code}: {message}")
+            )
 
     # =========================================================================
     # MCP HTTP Server
     # =========================================================================
 
     async def handle_mcp_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        """Handle an incoming MCP HTTP connection."""
+        """Handle MCP HTTP connection."""
         try:
-            # Read HTTP request line
             request_line = await reader.readline()
             if not request_line:
                 return
 
-            request_line = request_line.decode('utf-8', errors='replace').strip()
-            parts = request_line.split(' ')
+            parts = request_line.decode('utf-8', errors='replace').strip().split(' ')
             if len(parts) < 2:
-                await self._send_http_error(writer, 400, "Bad Request")
+                await self.send_http_error(writer, 400, "Bad Request")
                 return
 
             method, path = parts[0], parts[1]
 
-            # Read headers
             headers = {}
             while True:
                 line = await reader.readline()
-                if line == b'\r\n' or line == b'\n' or not line:
+                if line in (b'\r\n', b'\n', b''):
                     break
                 line = line.decode('utf-8', errors='replace').strip()
                 if ':' in line:
-                    key, value = line.split(':', 1)
-                    headers[key.lower().strip()] = value.strip()
+                    k, v = line.split(':', 1)
+                    headers[k.lower().strip()] = v.strip()
 
-            # Only handle POST /mcp
             if path != '/mcp':
-                await self._send_http_error(writer, 404, "Not Found")
+                await self.send_http_error(writer, 404, "Not Found")
                 return
 
             if method == 'POST':
-                # Read body
                 content_length = int(headers.get('content-length', 0))
-                body = b''
-                if content_length > 0:
-                    body = await reader.readexactly(content_length)
+                body = await reader.readexactly(content_length) if content_length > 0 else b''
 
-                # Parse JSON-RPC request
                 try:
                     request = json.loads(body.decode('utf-8'))
                 except json.JSONDecodeError as e:
-                    await self._send_jsonrpc_error(writer, None, -32700, f"Parse error: {e}")
+                    await self.send_jsonrpc_error(writer, None, -32700, str(e))
                     return
 
-                # Handle the request
-                response = await self.handle_mcp_jsonrpc(request)
-                await self._send_http_json(writer, response, headers.get('mcp-session-id'))
-
-            elif method == 'GET':
-                # SSE stream - not implemented yet, return error
-                await self._send_http_error(writer, 405, "Method Not Allowed")
-
+                response = await self.handle_mcp_request(request)
+                await self.send_http_json(writer, response)
             else:
-                await self._send_http_error(writer, 405, "Method Not Allowed")
+                await self.send_http_error(writer, 405, "Method Not Allowed")
 
-        except Exception as e:
-            print(f"[mcp] Connection error: {e}")
-            import traceback
-            traceback.print_exc()
+        except Exception:
+            pass
         finally:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
+            writer.close()
+            await writer.wait_closed()
 
-    async def _send_http_error(self, writer: asyncio.StreamWriter, status: int, message: str):
-        """Send an HTTP error response."""
+    async def send_http_error(self, writer, status: int, message: str):
+        """Send HTTP error."""
         body = json.dumps({"error": message}).encode('utf-8')
-        response = (
-            f"HTTP/1.1 {status} {message}\r\n"
-            f"Content-Type: application/json\r\n"
-            f"Content-Length: {len(body)}\r\n"
-            f"Connection: close\r\n"
-            f"\r\n"
-        ).encode('utf-8') + body
+        response = f"HTTP/1.1 {status} {message}\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body
         writer.write(response)
         await writer.drain()
 
-    async def _send_http_json(self, writer: asyncio.StreamWriter, data: dict, session_id: str = None):
-        """Send an HTTP JSON response."""
+    async def send_http_json(self, writer, data: dict):
+        """Send HTTP JSON response."""
         body = json.dumps(data).encode('utf-8')
-        headers = [
-            "HTTP/1.1 200 OK",
-            "Content-Type: application/json",
-            f"Content-Length: {len(body)}",
-            "Connection: close",
-        ]
+        headers = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\nConnection: close\r\n"
         if self.mcp_session_id:
-            headers.append(f"Mcp-Session-Id: {self.mcp_session_id}")
-        headers.append("")
-        headers.append("")
-        response = "\r\n".join(headers).encode('utf-8') + body
-        writer.write(response)
+            headers += f"Mcp-Session-Id: {self.mcp_session_id}\r\n"
+        headers += "\r\n"
+        writer.write(headers.encode() + body)
         await writer.drain()
 
-    async def _send_jsonrpc_error(self, writer: asyncio.StreamWriter, req_id, code: int, message: str):
-        """Send a JSON-RPC error response."""
-        response = {
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "error": {
-                "code": code,
-                "message": message
-            }
-        }
-        await self._send_http_json(writer, response)
+    async def send_jsonrpc_error(self, writer, req_id, code: int, message: str):
+        """Send JSON-RPC error."""
+        response = {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
+        await self.send_http_json(writer, response)
 
-    async def handle_mcp_jsonrpc(self, request: dict) -> dict:
-        """Handle a JSON-RPC request for MCP."""
+    async def handle_mcp_request(self, request: dict) -> dict:
+        """Handle MCP JSON-RPC request."""
         req_id = request.get('id')
         method = request.get('method', '')
         params = request.get('params', {})
 
-        print(f"[mcp] Request: {method} id={req_id}")
-
-        # Dispatch by method
         if method == 'initialize':
-            return await self.mcp_initialize(req_id, params)
+            self.mcp_session_id = secrets.token_hex(16)
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "protocolVersion": MCP_PROTOCOL_VERSION,
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": MCP_SERVER_NAME, "version": MCP_SERVER_VERSION}
+                }
+            }
+
         elif method == 'initialized':
-            # Client acknowledgment - no response needed
             return {"jsonrpc": "2.0", "id": req_id, "result": {}}
+
         elif method == 'tools/list':
-            return await self.mcp_tools_list(req_id, params)
+            return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": MCP_TOOLS}}
+
         elif method == 'tools/call':
-            return await self.mcp_tools_call(req_id, params)
+            return await self.handle_tool_call(req_id, params)
+
         elif method == 'ping':
             return {"jsonrpc": "2.0", "id": req_id, "result": {}}
+
         else:
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "error": {
-                    "code": -32601,
-                    "message": f"Method not found: {method}"
-                }
-            }
+            return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Unknown method: {method}"}}
 
-    async def mcp_initialize(self, req_id, params: dict) -> dict:
-        """Handle MCP initialize request."""
-        import secrets
-        self.mcp_session_id = secrets.token_hex(16)
+    # =========================================================================
+    # MCP Tool Handlers
+    # =========================================================================
 
-        return {
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {
-                "protocolVersion": MCP_PROTOCOL_VERSION,
-                "capabilities": {
-                    "tools": {}
-                },
-                "serverInfo": {
-                    "name": MCP_SERVER_NAME,
-                    "version": MCP_SERVER_VERSION
-                }
-            }
-        }
-
-    async def mcp_tools_list(self, req_id, params: dict) -> dict:
-        """Handle tools/list request."""
-        return {
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {
-                "tools": MCP_TOOLS
-            }
-        }
-
-    async def mcp_tools_call(self, req_id, params: dict) -> dict:
-        """Handle tools/call request."""
+    async def handle_tool_call(self, req_id, params: dict) -> dict:
+        """Handle MCP tool call."""
         tool_name = params.get('name', '')
-        arguments = params.get('arguments', {})
+        args = params.get('arguments', {})
 
-        print(f"[mcp] Tool call: {tool_name} args={list(arguments.keys())}")
-
-        # Check if remote client is connected
-        if not self.client_writer:
-            return self._mcp_tool_error(req_id, "Remote client not connected")
+        if not self.client_connected.is_set():
+            return self.tool_error(req_id, "Client not connected")
 
         try:
-            # Dispatch to tool handler
-            if tool_name == 'get_cwd':
-                result = self._mcp_tool_get_cwd()
-            elif tool_name == 'read_file':
-                result = await self._mcp_tool_read_file(arguments)
-            elif tool_name == 'write_file':
-                result = await self._mcp_tool_write_file(arguments)
-            elif tool_name == 'edit_file':
-                result = await self._mcp_tool_edit_file(arguments)
-            elif tool_name == 'list_directory':
-                result = await self._mcp_tool_list_directory(arguments)
-            elif tool_name == 'file_info':
-                result = await self._mcp_tool_file_info(arguments)
-            elif tool_name == 'file_exists':
-                result = await self._mcp_tool_file_exists(arguments)
-            elif tool_name == 'search_files':
-                result = await self._mcp_tool_search_files(arguments)
-            elif tool_name == 'find_files':
-                result = await self._mcp_tool_find_files(arguments)
-            elif tool_name == 'execute_command':
-                result = await self._mcp_tool_execute_command(arguments)
-            elif tool_name == 'make_directory':
-                result = await self._mcp_tool_make_directory(arguments)
-            elif tool_name == 'remove_file':
-                result = await self._mcp_tool_remove_file(arguments)
-            elif tool_name == 'move_file':
-                result = await self._mcp_tool_move_file(arguments)
-            elif tool_name == 'download_url':
-                result = await self._mcp_tool_download_url(arguments)
-            else:
-                return self._mcp_tool_error(req_id, f"Unknown tool: {tool_name}")
-
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": result
+            handlers = {
+                'get_cwd': self.tool_get_cwd,
+                'read_file': self.tool_read_file,
+                'write_file': self.tool_write_file,
+                'edit_file': self.tool_edit_file,
+                'list_directory': self.tool_list_directory,
+                'file_info': self.tool_file_info,
+                'file_exists': self.tool_file_exists,
+                'search_files': self.tool_search_files,
+                'find_files': self.tool_find_files,
+                'execute_command': self.tool_execute_command,
+                'make_directory': self.tool_make_directory,
+                'remove_file': self.tool_remove_file,
+                'move_file': self.tool_move_file,
+                'download_url': self.tool_download_url,
+                'upload_to_host': self.tool_upload_to_host,
+                'download_from_host': self.tool_download_from_host,
             }
+
+            handler = handlers.get(tool_name)
+            if not handler:
+                return self.tool_error(req_id, f"Unknown tool: {tool_name}")
+
+            result = await handler(args)
+            return {"jsonrpc": "2.0", "id": req_id, "result": result}
 
         except Exception as e:
-            print(f"[mcp] Tool error: {e}")
-            import traceback
-            traceback.print_exc()
-            return self._mcp_tool_error(req_id, str(e))
+            return self.tool_error(req_id, str(e))
 
-    def _mcp_tool_error(self, req_id, message: str) -> dict:
-        """Return an MCP tool error result."""
+    def tool_error(self, req_id, message: str) -> dict:
+        """Return tool error response."""
         return {
             "jsonrpc": "2.0",
             "id": req_id,
-            "result": {
-                "content": [{"type": "text", "text": f"Error: {message}"}],
-                "isError": True
-            }
+            "result": {"content": [{"type": "text", "text": f"Error: {message}"}], "isError": True}
         }
 
-    def _mcp_tool_success(self, text: str) -> dict:
-        """Return an MCP tool success result."""
-        return {
-            "content": [{"type": "text", "text": text}],
-            "isError": False
-        }
+    def tool_success(self, text: str) -> dict:
+        """Return tool success response."""
+        return {"content": [{"type": "text", "text": text}], "isError": False}
 
-    async def _mcp_send_request(self, op_type: str, params: dict) -> dict:
-        """Send a request to the remote client and wait for response."""
-        self.mcp_request_id += 1
-        req_id = self.mcp_request_id + 100000  # Offset to avoid collision with inject requests
+    def resolve_path(self, path: str) -> str:
+        """Resolve path against remote cwd."""
+        if not path or path.startswith('/'):
+            return path or self.remote_cwd
+        import posixpath
+        return posixpath.normpath(posixpath.join(self.remote_cwd, path))
 
-        # Send to remote client
-        await self.send_to_client({
-            'type': 'request',
-            'id': req_id,
-            'op': op_type,
-            'params': params
-        })
+    def resolve_host_path(self, path: str) -> str:
+        """Resolve and validate host path, restricting to base directory.
 
-        # Wait for response
-        future = asyncio.get_event_loop().create_future()
-        self.pending_requests[req_id] = future
+        Raises Exception if path escapes base directory.
+        """
+        # Expand ~ and make absolute
+        expanded = os.path.expanduser(path)
+        if not os.path.isabs(expanded):
+            expanded = os.path.join(self.host_base_dir, expanded)
+        resolved = os.path.abspath(expanded)
+
+        # Security check: must be under base directory
+        if not resolved.startswith(self.host_base_dir + os.sep) and resolved != self.host_base_dir:
+            raise Exception(f"Host path must be under {self.host_base_dir}")
+
+        return resolved
+
+    # -------------------------------------------------------------------------
+    # Tool: get_cwd
+    # -------------------------------------------------------------------------
+
+    async def tool_get_cwd(self, args: dict) -> dict:
+        """Return remote working directory."""
+        return self.tool_success(f"Current working directory: {self.remote_cwd}")
+
+    # -------------------------------------------------------------------------
+    # Tool: read_file
+    # -------------------------------------------------------------------------
+
+    async def tool_read_file(self, args: dict) -> dict:
+        """Read file via FILE_READ stream."""
+        path = self.resolve_path(args.get('path', ''))
+        offset = args.get('offset', 0)
+        limit = args.get('limit', 2000)
+
+        if not path:
+            raise Exception("path is required")
+
+        stream_id = await self.open_stream(STREAM_FILE_READ, encode_string(path))
+        status, extra = await self.wait_stream(stream_id)
+
+        if status != STATUS_OK:
+            raise Exception(f"Read failed: status={status}")
+
+        content = self.get_stream_data(stream_id)
 
         try:
-            response = await asyncio.wait_for(future, timeout=300.0)
-            return response
-        except asyncio.TimeoutError:
-            raise Exception("Request timeout")
+            text = content.decode('utf-8', errors='replace')
+        except:
+            text = content.decode('latin-1')
 
-    # =========================================================================
-    # MCP Tool Implementations
-    # =========================================================================
+        lines = text.split('\n')
+        total = len(lines)
+        selected = lines[offset:offset + limit]
 
-    def _mcp_tool_get_cwd(self) -> dict:
-        """Return the current working directory on the remote system."""
-        cwd = self.remote_cwd or "(unknown - client did not send cwd)"
-        return self._mcp_tool_success(f"Current working directory: {cwd}")
+        formatted = '\n'.join(f"{i+offset+1:6}\t{line[:2000]}" for i, line in enumerate(selected))
 
-    def _resolve_remote_path(self, path: str) -> str:
-        """Resolve a path relative to the remote cwd if not absolute."""
-        if not path:
-            return path
-        if path.startswith('/'):
-            return path  # Already absolute
-        # Resolve relative to remote cwd
-        if self.remote_cwd:
-            import posixpath
-            return posixpath.normpath(posixpath.join(self.remote_cwd, path))
-        return path  # No remote cwd, return as-is
+        if offset + limit < total:
+            formatted += f"\n\n[Lines {offset+1}-{offset+len(selected)} of {total}]"
 
-    async def _mcp_tool_read_file(self, args: dict) -> dict:
-        """Read file contents with line limits like native Read tool."""
-        import base64
+        return self.tool_success(formatted)
 
-        path = args.get('path', '')
-        offset = args.get('offset', 0)  # Line offset (0-based, but we display 1-based)
-        limit = args.get('limit', 2000)  # Max lines to read
+    # -------------------------------------------------------------------------
+    # Tool: write_file
+    # -------------------------------------------------------------------------
 
-        if not path:
-            raise Exception("path is required")
-
-        # Resolve relative paths against remote cwd
-        resolved_path = self._resolve_remote_path(path)
-        print(f"[mcp] read_file: {path} -> {resolved_path}")
-
-        response = await self._mcp_send_request('fs.readFile', {'path': resolved_path})
-
-        if 'error' in response:
-            raise Exception(response['error'])
-
-        content = response.get('result', '')
-
-        # Client always sends base64-encoded file contents
-        if content:
-            try:
-                content = base64.b64decode(content).decode('utf-8', errors='replace')
-            except:
-                pass  # Decode failed, use as-is (shouldn't happen)
-
-        # Split into lines and apply limits
-        lines = content.split('\n')
-        total_lines = len(lines)
-
-        # Apply offset and limit
-        start = min(offset, total_lines)
-        end = min(start + limit, total_lines)
-        selected_lines = lines[start:end]
-
-        # Format with line numbers (like cat -n) and truncate long lines
-        MAX_LINE_LENGTH = 2000
-        formatted_lines = []
-        for i, line in enumerate(selected_lines, start=start + 1):
-            if len(line) > MAX_LINE_LENGTH:
-                line = line[:MAX_LINE_LENGTH] + '... (truncated)'
-            formatted_lines.append(f"{i:6}\t{line}")
-
-        result = '\n'.join(formatted_lines)
-
-        # Add info about truncation if needed
-        if end < total_lines:
-            result += f"\n\n[Showing lines {start+1}-{end} of {total_lines}. Use offset/limit to see more.]"
-
-        return self._mcp_tool_success(result)
-
-    async def _mcp_tool_write_file(self, args: dict) -> dict:
-        """Write file contents."""
-        path = args.get('path', '')
+    async def tool_write_file(self, args: dict) -> dict:
+        """Write file via FILE_WRITE stream."""
+        path = self.resolve_path(args.get('path', ''))
         content = args.get('content', '')
+
         if not path:
             raise Exception("path is required")
 
-        resolved_path = self._resolve_remote_path(path)
-        print(f"[mcp] write_file: {path} -> {resolved_path}")
+        metadata = encode_string(path) + struct.pack('>H', 0o644)
+        stream_id = await self.open_stream(STREAM_FILE_WRITE, metadata)
 
-        response = await self._mcp_send_request('fs.writeFile', {
-            'path': resolved_path,
-            'data': content
-        })
+        data = content.encode('utf-8')
+        for i in range(0, len(data), CHUNK_SIZE):
+            chunk = data[i:i + CHUNK_SIZE]
+            payload = struct.pack('>I', stream_id) + chunk
+            await self.send_packet(PKT_STREAM_DATA, payload)
 
-        if 'error' in response:
-            raise Exception(response['error'])
+        payload = struct.pack('>IB', stream_id, STATUS_OK)
+        await self.send_packet(PKT_STREAM_END, payload)
 
-        return self._mcp_tool_success(f"Successfully wrote {len(content)} bytes to {resolved_path}")
+        status, extra = await self.wait_stream(stream_id)
 
-    async def _mcp_tool_edit_file(self, args: dict) -> dict:
-        """Edit file by replacing old_string with new_string."""
-        import base64
+        if status != STATUS_OK:
+            raise Exception(f"Write failed: status={status}")
 
-        path = args.get('path', '')
+        return self.tool_success(f"Wrote {len(data)} bytes to {path}")
+
+    # -------------------------------------------------------------------------
+    # Tool: edit_file
+    # -------------------------------------------------------------------------
+
+    async def tool_edit_file(self, args: dict) -> dict:
+        """Edit file via read-modify-write."""
+        path = self.resolve_path(args.get('path', ''))
         old_string = args.get('old_string', '')
         new_string = args.get('new_string', '')
         replace_all = args.get('replace_all', False)
@@ -1159,328 +1053,463 @@ COMMAND TIMEOUTS:
         if not old_string:
             raise Exception("old_string is required")
 
-        resolved_path = self._resolve_remote_path(path)
-        print(f"[mcp] edit_file: {path} -> {resolved_path}")
+        stream_id = await self.open_stream(STREAM_FILE_READ, encode_string(path))
+        status, _ = await self.wait_stream(stream_id)
+        if status != STATUS_OK:
+            raise Exception("Failed to read file")
 
-        # First, read the file
-        response = await self._mcp_send_request('fs.readFile', {'path': resolved_path})
-        if 'error' in response:
-            raise Exception(response['error'])
+        content = self.get_stream_data(stream_id).decode('utf-8', errors='replace')
 
-        content = response.get('result', '')
-
-        # Client always sends base64-encoded file contents
-        if content:
-            try:
-                content = base64.b64decode(content).decode('utf-8', errors='replace')
-            except:
-                pass  # Decode failed, use as-is
-
-        # Count occurrences
         count = content.count(old_string)
-
         if count == 0:
-            raise Exception(f"old_string not found in file. Make sure whitespace and indentation match exactly.")
-
+            raise Exception("old_string not found in file")
         if count > 1 and not replace_all:
-            raise Exception(f"old_string found {count} times in file. Use replace_all=true to replace all, or provide more context to make it unique.")
+            raise Exception(f"old_string found {count} times. Use replace_all=true or provide more context.")
 
-        # Perform replacement
         if replace_all:
             new_content = content.replace(old_string, new_string)
         else:
             new_content = content.replace(old_string, new_string, 1)
 
-        # Write back
-        response = await self._mcp_send_request('fs.writeFile', {
-            'path': resolved_path,
-            'data': new_content
-        })
+        metadata = encode_string(path) + struct.pack('>H', 0o644)
+        stream_id = await self.open_stream(STREAM_FILE_WRITE, metadata)
 
-        if 'error' in response:
-            raise Exception(response['error'])
+        data = new_content.encode('utf-8')
+        for i in range(0, len(data), CHUNK_SIZE):
+            chunk = data[i:i + CHUNK_SIZE]
+            payload = struct.pack('>I', stream_id) + chunk
+            await self.send_packet(PKT_STREAM_DATA, payload)
 
-        if replace_all:
-            return self._mcp_tool_success(f"Replaced {count} occurrence(s) in {resolved_path}")
-        else:
-            return self._mcp_tool_success(f"Successfully edited {resolved_path}")
+        payload = struct.pack('>IB', stream_id, STATUS_OK)
+        await self.send_packet(PKT_STREAM_END, payload)
 
-    async def _mcp_tool_list_directory(self, args: dict) -> dict:
-        """List directory contents."""
-        path = args.get('path', '.')
-        resolved_path = self._resolve_remote_path(path)
-        print(f"[mcp] list_directory: {path} -> {resolved_path}")
+        status, _ = await self.wait_stream(stream_id)
+        if status != STATUS_OK:
+            raise Exception("Failed to write file")
 
-        response = await self._mcp_send_request('fs.readdir', {'path': resolved_path})
+        msg = f"Replaced {count} occurrence(s)" if replace_all else "Edit successful"
+        return self.tool_success(f"{msg} in {path}")
 
-        if 'error' in response:
-            raise Exception(response['error'])
+    # -------------------------------------------------------------------------
+    # Tool: list_directory
+    # -------------------------------------------------------------------------
 
-        entries = response.get('result', [])
-        if isinstance(entries, list):
-            # Handle both string entries and dict entries (with 'name' field)
-            names = []
-            for entry in entries:
-                if isinstance(entry, str):
-                    names.append(entry)
-                elif isinstance(entry, dict):
-                    names.append(entry.get('name', str(entry)))
-                else:
-                    names.append(str(entry))
-            text = '\n'.join(names)
-        else:
-            text = str(entries)
+    async def tool_list_directory(self, args: dict) -> dict:
+        """List directory via DIR_LIST stream."""
+        path = self.resolve_path(args.get('path', '.'))
 
-        return self._mcp_tool_success(text)
+        stream_id = await self.open_stream(STREAM_DIR_LIST, encode_string(path))
+        status, _ = await self.wait_stream(stream_id)
 
-    async def _mcp_tool_file_info(self, args: dict) -> dict:
-        """Get file metadata."""
-        path = args.get('path', '')
+        if status != STATUS_OK:
+            raise Exception(f"List failed: status={status}")
+
+        data = self.get_stream_data(stream_id)
+
+        entries = []
+        offset = 0
+        while offset < len(data):
+            if offset + 17 > len(data):
+                break
+            entry_type = chr(data[offset])
+            size = struct.unpack('>Q', data[offset+1:offset+9])[0]
+            mtime = struct.unpack('>Q', data[offset+9:offset+17])[0]
+            name, new_offset = decode_string(data, offset + 17)
+            offset = new_offset
+
+            type_char = '/' if entry_type == 'd' else '@' if entry_type == 'l' else ''
+            entries.append(f"{name}{type_char}")
+
+        return self.tool_success('\n'.join(entries) if entries else "(empty directory)")
+
+    # -------------------------------------------------------------------------
+    # Tool: file_info
+    # -------------------------------------------------------------------------
+
+    async def tool_file_info(self, args: dict) -> dict:
+        """Get file info via FILE_STAT stream."""
+        path = self.resolve_path(args.get('path', ''))
+
         if not path:
             raise Exception("path is required")
 
-        resolved_path = self._resolve_remote_path(path)
-        response = await self._mcp_send_request('fs.stat', {'path': resolved_path})
+        stream_id = await self.open_stream(STREAM_FILE_STAT, encode_string(path))
+        status, _ = await self.wait_stream(stream_id)
 
-        if 'error' in response:
-            raise Exception(response['error'])
+        if status != STATUS_OK:
+            raise Exception(f"Stat failed: status={status}")
 
-        result = response.get('result', {})
-        info_lines = []
-        if 'size' in result:
-            info_lines.append(f"Size: {result['size']} bytes")
-        if 'mtime' in result:
-            info_lines.append(f"Modified: {result['mtime']}")
-        if result.get('isDirectory'):
-            info_lines.append("Type: directory")
-        elif result.get('isFile'):
-            info_lines.append("Type: file")
-        elif result.get('isSymbolicLink'):
-            info_lines.append("Type: symlink")
+        data = self.get_stream_data(stream_id)
 
-        return self._mcp_tool_success('\n'.join(info_lines) or "File exists")
+        if len(data) < 22:
+            raise Exception("Invalid stat response")
 
-    async def _mcp_tool_file_exists(self, args: dict) -> dict:
-        """Check if file exists."""
-        path = args.get('path', '')
+        exists = data[0]
+        if not exists:
+            return self.tool_success("File does not exist")
+
+        ftype = chr(data[1])
+        mode = struct.unpack('>I', data[2:6])[0]
+        size = struct.unpack('>Q', data[6:14])[0]
+        mtime = struct.unpack('>Q', data[14:22])[0]
+
+        type_str = {'f': 'file', 'd': 'directory', 'l': 'symlink'}.get(ftype, 'other')
+        import datetime
+        mtime_str = datetime.datetime.fromtimestamp(mtime).isoformat()
+
+        return self.tool_success(f"Type: {type_str}\nSize: {size} bytes\nModified: {mtime_str}\nMode: {oct(mode)}")
+
+    # -------------------------------------------------------------------------
+    # Tool: file_exists
+    # -------------------------------------------------------------------------
+
+    async def tool_file_exists(self, args: dict) -> dict:
+        """Check file existence via FILE_EXISTS stream."""
+        path = self.resolve_path(args.get('path', ''))
+
         if not path:
             raise Exception("path is required")
 
-        resolved_path = self._resolve_remote_path(path)
-        response = await self._mcp_send_request('fs.exists', {'path': resolved_path})
+        stream_id = await self.open_stream(STREAM_FILE_EXISTS, encode_string(path))
+        status, _ = await self.wait_stream(stream_id)
 
-        if 'error' in response:
-            # Error checking existence - treat as not exists
-            return self._mcp_tool_success("false")
+        data = self.get_stream_data(stream_id)
+        exists = data[0] if data else 0
 
-        exists = response.get('result', False)
-        return self._mcp_tool_success("true" if exists else "false")
+        return self.tool_success("true" if exists else "false")
 
-    async def _mcp_tool_search_files(self, args: dict) -> dict:
-        """Search for pattern in files (native implementation)."""
+    # -------------------------------------------------------------------------
+    # Tool: search_files
+    # -------------------------------------------------------------------------
+
+    async def tool_search_files(self, args: dict) -> dict:
+        """Search files via FILE_SEARCH stream."""
         pattern = args.get('pattern', '')
-        path = args.get('path', '.')
+        path = self.resolve_path(args.get('path', '.'))
         file_pattern = args.get('file_pattern', '')
 
         if not pattern:
             raise Exception("pattern is required")
 
-        resolved_path = self._resolve_remote_path(path)
-        print(f"[mcp] search_files: pattern={pattern} path={resolved_path} file_pattern={file_pattern}")
+        metadata = encode_string(path) + encode_string(pattern)
+        if file_pattern:
+            metadata += encode_string(file_pattern)
 
-        # Use native fs.search instead of shell grep
-        response = await self._mcp_send_request('fs.search', {
-            'path': resolved_path,
-            'pattern': pattern,
-            'filePattern': file_pattern or ''
-        })
+        stream_id = await self.open_stream(STREAM_FILE_SEARCH, metadata)
+        status, _ = await self.wait_stream(stream_id)
 
-        if 'error' in response:
-            raise Exception(response['error'])
+        if status != STATUS_OK:
+            raise Exception(f"Search failed: status={status}")
 
-        result = response.get('result', [])
+        data = self.get_stream_data(stream_id)
 
-        if isinstance(result, list):
-            if result:
-                return self._mcp_tool_success('\n'.join(result))
-            else:
-                return self._mcp_tool_success("No matches found")
-        else:
-            return self._mcp_tool_success(str(result) if result else "No matches found")
+        matches = []
+        offset = 0
+        while offset < len(data):
+            if offset + 4 > len(data):
+                break
+            line_num = struct.unpack('>I', data[offset:offset+4])[0]
+            fpath, offset = decode_string(data, offset + 4)
+            line, offset = decode_string(data, offset)
+            matches.append(f"{fpath}:{line_num}: {line}")
 
-    async def _mcp_tool_find_files(self, args: dict) -> dict:
-        """Find files matching pattern (native implementation)."""
+        return self.tool_success('\n'.join(matches) if matches else "No matches found")
+
+    # -------------------------------------------------------------------------
+    # Tool: find_files
+    # -------------------------------------------------------------------------
+
+    async def tool_find_files(self, args: dict) -> dict:
+        """Find files via FILE_FIND stream."""
         pattern = args.get('pattern', '')
-        path = args.get('path', '.')
+        path = self.resolve_path(args.get('path', '.'))
 
         if not pattern:
             raise Exception("pattern is required")
 
-        resolved_path = self._resolve_remote_path(path)
-        print(f"[mcp] find_files: pattern={pattern} path={resolved_path}")
+        metadata = encode_string(path) + encode_string(pattern)
+        stream_id = await self.open_stream(STREAM_FILE_FIND, metadata)
+        status, _ = await self.wait_stream(stream_id)
 
-        # Use native fs.find instead of shell find
-        response = await self._mcp_send_request('fs.find', {
-            'path': resolved_path,
-            'pattern': pattern
-        })
+        if status != STATUS_OK:
+            raise Exception(f"Find failed: status={status}")
 
-        if 'error' in response:
-            raise Exception(response['error'])
+        data = self.get_stream_data(stream_id)
 
-        result = response.get('result', [])
+        paths = []
+        offset = 0
+        while offset < len(data):
+            fpath, offset = decode_string(data, offset)
+            if fpath:
+                paths.append(fpath)
 
-        if isinstance(result, list):
-            if result:
-                return self._mcp_tool_success('\n'.join(result))
-            else:
-                return self._mcp_tool_success("No files found")
-        else:
-            return self._mcp_tool_success(str(result) if result else "No files found")
+        return self.tool_success('\n'.join(paths) if paths else "No files found")
 
-    async def _mcp_tool_execute_command(self, args: dict) -> dict:
-        """Execute shell command."""
+    # -------------------------------------------------------------------------
+    # Tool: execute_command
+    # -------------------------------------------------------------------------
+
+    async def tool_execute_command(self, args: dict) -> dict:
+        """Execute command via EXEC stream."""
         command = args.get('command', '')
+
         if not command:
             raise Exception("command is required")
 
-        response = await self._mcp_send_request('cp.exec', {'command': command})
+        stream_id = await self.open_stream(STREAM_EXEC, encode_string(command))
+        status, extra = await self.wait_stream(stream_id)
 
-        if 'error' in response:
-            raise Exception(response['error'])
+        if status != STATUS_OK:
+            raise Exception(f"Command failed: status={status}")
 
-        result = response.get('result', {})
-        stdout = result.get('stdout', '')
-        stderr = result.get('stderr', '')
-        status = result.get('status', 0)
+        exit_code = 0
+        if len(extra) >= 4:
+            exit_code = struct.unpack('>i', extra[:4])[0]
 
-        output_parts = []
+        chunks = self.get_stream_chunks(stream_id)
+
+        stdout_parts = []
+        stderr_parts = []
+
+        for chunk in chunks:
+            if len(chunk) < 1:
+                continue
+            channel = chunk[0]
+            data = chunk[1:]
+            if channel == 0x01:
+                stdout_parts.append(data)
+            elif channel == 0x02:
+                stderr_parts.append(data)
+            else:
+                stdout_parts.append(data)
+
+        stdout = b''.join(stdout_parts).decode('utf-8', errors='replace')
+        stderr = b''.join(stderr_parts).decode('utf-8', errors='replace')
+
+        parts = []
         if stdout:
-            output_parts.append(stdout)
+            parts.append(stdout)
         if stderr:
-            output_parts.append(f"[stderr]\n{stderr}")
-        if status != 0:
-            output_parts.append(f"[exit status: {status}]")
+            parts.append(f"[stderr]\n{stderr}")
+        if exit_code != 0:
+            parts.append(f"[exit status: {exit_code}]")
 
-        return self._mcp_tool_success('\n'.join(output_parts) or "(no output)")
+        return self.tool_success('\n'.join(parts) or "(no output)")
 
-    async def _mcp_tool_make_directory(self, args: dict) -> dict:
-        """Create directory."""
-        path = args.get('path', '')
+    # -------------------------------------------------------------------------
+    # Tool: make_directory
+    # -------------------------------------------------------------------------
+
+    async def tool_make_directory(self, args: dict) -> dict:
+        """Create directory via MKDIR stream."""
+        path = self.resolve_path(args.get('path', ''))
+
         if not path:
             raise Exception("path is required")
 
-        resolved_path = self._resolve_remote_path(path)
-        response = await self._mcp_send_request('fs.mkdir', {'path': resolved_path})
+        stream_id = await self.open_stream(STREAM_MKDIR, encode_string(path))
+        status, _ = await self.wait_stream(stream_id)
 
-        if 'error' in response:
-            raise Exception(response['error'])
+        if status != STATUS_OK:
+            raise Exception(f"mkdir failed: status={status}")
 
-        return self._mcp_tool_success(f"Created directory: {resolved_path}")
+        return self.tool_success(f"Created directory: {path}")
 
-    async def _mcp_tool_remove_file(self, args: dict) -> dict:
-        """Remove file."""
-        path = args.get('path', '')
+    # -------------------------------------------------------------------------
+    # Tool: remove_file
+    # -------------------------------------------------------------------------
+
+    async def tool_remove_file(self, args: dict) -> dict:
+        """Remove file via REMOVE stream."""
+        path = self.resolve_path(args.get('path', ''))
+
         if not path:
             raise Exception("path is required")
 
-        resolved_path = self._resolve_remote_path(path)
-        response = await self._mcp_send_request('fs.unlink', {'path': resolved_path})
+        stream_id = await self.open_stream(STREAM_REMOVE, encode_string(path))
+        status, _ = await self.wait_stream(stream_id)
 
-        if 'error' in response:
-            raise Exception(response['error'])
+        if status != STATUS_OK:
+            raise Exception(f"remove failed: status={status}")
 
-        return self._mcp_tool_success(f"Removed: {resolved_path}")
+        return self.tool_success(f"Removed: {path}")
 
-    async def _mcp_tool_move_file(self, args: dict) -> dict:
-        """Move/rename file."""
-        source = args.get('source', '')
-        destination = args.get('destination', '')
-        if not source or not destination:
+    # -------------------------------------------------------------------------
+    # Tool: move_file
+    # -------------------------------------------------------------------------
+
+    async def tool_move_file(self, args: dict) -> dict:
+        """Move file via MOVE stream."""
+        source = self.resolve_path(args.get('source', ''))
+        dest = self.resolve_path(args.get('destination', ''))
+
+        if not source or not dest:
             raise Exception("source and destination are required")
 
-        resolved_source = self._resolve_remote_path(source)
-        resolved_dest = self._resolve_remote_path(destination)
+        metadata = encode_string(source) + encode_string(dest)
+        stream_id = await self.open_stream(STREAM_MOVE, metadata)
+        status, _ = await self.wait_stream(stream_id)
 
-        response = await self._mcp_send_request('fs.rename', {
-            'oldPath': resolved_source,
-            'newPath': resolved_dest
-        })
+        if status != STATUS_OK:
+            raise Exception(f"move failed: status={status}")
 
-        if 'error' in response:
-            raise Exception(response['error'])
+        return self.tool_success(f"Moved {source} to {dest}")
 
-        return self._mcp_tool_success(f"Moved {resolved_source} to {resolved_dest}")
+    # -------------------------------------------------------------------------
+    # Tool: download_url
+    # -------------------------------------------------------------------------
 
-    async def _mcp_tool_download_url(self, args: dict) -> dict:
-        """Download file from URL and save to remote system."""
+    async def tool_download_url(self, args: dict) -> dict:
+        """Download URL and write to remote.
+
+        Relative paths are saved to /tmp to avoid cluttering working directory.
+        Use absolute path to save elsewhere.
+        """
         import urllib.request
         import urllib.error
-        import base64
 
         url = args.get('url', '')
-        path = args.get('path', '')
+        raw_path = args.get('path', '')
+
+        # Relative paths go to /tmp, absolute paths used as-is
+        if raw_path and not raw_path.startswith('/'):
+            import posixpath
+            path = posixpath.join('/tmp', raw_path)
+        else:
+            path = raw_path
+
         if not url:
             raise Exception("url is required")
         if not path:
             raise Exception("path is required")
 
-        resolved_path = self._resolve_remote_path(path)
-        print(f"[mcp] download_url: {url} -> {resolved_path}")
-
-        # Fetch URL on Linux host (has modern SSL/TLS)
         try:
-            req = urllib.request.Request(url, headers={
-                'User-Agent': 'claude-telepresence/1.0'
-            })
-            with urllib.request.urlopen(req, timeout=60) as response:
-                content = response.read()
-                content_type = response.headers.get('Content-Type', 'unknown')
+            req = urllib.request.Request(url, headers={'User-Agent': 'claude-telepresence/2.0'})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                content = resp.read()
+                content_type = resp.headers.get('Content-Type', 'unknown')
         except urllib.error.HTTPError as e:
             raise Exception(f"HTTP error {e.code}: {e.reason}")
         except urllib.error.URLError as e:
             raise Exception(f"URL error: {e.reason}")
-        except Exception as e:
-            raise Exception(f"Download failed: {e}")
 
-        # Send to client as base64
-        encoded = base64.b64encode(content).decode('ascii')
+        metadata = encode_string(path) + struct.pack('>H', 0o644)
+        stream_id = await self.open_stream(STREAM_FILE_WRITE, metadata)
 
-        response = await self._mcp_send_request('fs.writeFile', {
-            'path': resolved_path,
-            'data': encoded,
-            'isBuffer': True
-        })
+        for i in range(0, len(content), CHUNK_SIZE):
+            chunk = content[i:i + CHUNK_SIZE]
+            payload = struct.pack('>I', stream_id) + chunk
+            await self.send_packet(PKT_STREAM_DATA, payload)
 
-        if 'error' in response:
-            raise Exception(response['error'])
+        payload = struct.pack('>IB', stream_id, STATUS_OK)
+        await self.send_packet(PKT_STREAM_END, payload)
 
-        return self._mcp_tool_success(
-            f"Downloaded {len(content)} bytes from {url}\n"
-            f"Saved to: {resolved_path}\n"
-            f"Content-Type: {content_type}"
-        )
+        status, _ = await self.wait_stream(stream_id)
+        if status != STATUS_OK:
+            raise Exception("Failed to write downloaded file")
 
-    # =========================================================================
-    # End MCP Server
-    # =========================================================================
+        return self.tool_success(f"Downloaded {len(content)} bytes from {url}\nSaved to: {path}\nContent-Type: {content_type}")
 
-    async def recv_from_client(self) -> dict:
-        """Receive a message from the remote client."""
-        if not self.client_reader:
-            return None
+    # -------------------------------------------------------------------------
+    # Tool: upload_to_host
+    # -------------------------------------------------------------------------
 
+    async def tool_upload_to_host(self, args: dict) -> dict:
+        """Copy file from remote legacy system to Linux host."""
+        remote_path = self.resolve_path(args.get('remote_path', ''))
+        host_path_arg = args.get('host_path', '')
+        overwrite = args.get('overwrite', False)
+
+        if not remote_path:
+            raise Exception("remote_path is required")
+        if not host_path_arg:
+            raise Exception("host_path is required")
+
+        # Resolve and validate host path (restricted to relay start directory)
+        host_path = self.resolve_host_path(host_path_arg)
+
+        # Check if destination exists
+        if os.path.exists(host_path) and not overwrite:
+            raise Exception(f"Host file already exists: {host_path} (use overwrite=true to replace)")
+
+        # Read from remote
+        stream_id = await self.open_stream(STREAM_FILE_READ, encode_string(remote_path))
+        status, _ = await self.wait_stream(stream_id)
+
+        if status != STATUS_OK:
+            raise Exception(f"Failed to read remote file: {remote_path}")
+
+        content = self.get_stream_data(stream_id)
+
+        # Write to host
         try:
-            # Read length header
-            header = await self.client_reader.readexactly(4)
-            length = struct.unpack('>I', header)[0]
+            parent_dir = os.path.dirname(host_path)
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
+            with open(host_path, 'wb') as f:
+                f.write(content)
+        except OSError as e:
+            raise Exception(f"Failed to write host file: {e}")
 
-            # Read message
-            data = await self.client_reader.readexactly(length)
-            return json.loads(data.decode('utf-8'))
+        return self.tool_success(f"Uploaded {len(content)} bytes\nFrom remote: {remote_path}\nTo host: {host_path}")
 
-        except (asyncio.IncompleteReadError, ConnectionResetError):
-            return None
+    # -------------------------------------------------------------------------
+    # Tool: download_from_host
+    # -------------------------------------------------------------------------
+
+    async def tool_download_from_host(self, args: dict) -> dict:
+        """Copy file from Linux host to remote legacy system."""
+        host_path_arg = args.get('host_path', '')
+        remote_path = self.resolve_path(args.get('remote_path', ''))
+        overwrite = args.get('overwrite', False)
+
+        if not host_path_arg:
+            raise Exception("host_path is required")
+        if not remote_path:
+            raise Exception("remote_path is required")
+
+        # Resolve and validate host path (restricted to relay start directory)
+        host_path = self.resolve_host_path(host_path_arg)
+
+        # Check if remote destination exists
+        if not overwrite:
+            stream_id = await self.open_stream(STREAM_FILE_EXISTS, encode_string(remote_path))
+            await self.wait_stream(stream_id)
+            data = self.get_stream_data(stream_id)
+            exists = data[0] if data else 0
+            if exists:
+                raise Exception(f"Remote file already exists: {remote_path} (use overwrite=true to replace)")
+
+        # Read from host
+        try:
+            with open(host_path, 'rb') as f:
+                content = f.read()
+        except FileNotFoundError:
+            raise Exception(f"Host file not found: {host_path}")
+        except OSError as e:
+            raise Exception(f"Failed to read host file: {e}")
+
+        # Write to remote
+        metadata = encode_string(remote_path) + struct.pack('>H', 0o644)
+        stream_id = await self.open_stream(STREAM_FILE_WRITE, metadata)
+
+        for i in range(0, len(content), CHUNK_SIZE):
+            chunk = content[i:i + CHUNK_SIZE]
+            payload = struct.pack('>I', stream_id) + chunk
+            await self.send_packet(PKT_STREAM_DATA, payload)
+
+        payload = struct.pack('>IB', stream_id, STATUS_OK)
+        await self.send_packet(PKT_STREAM_END, payload)
+
+        status, _ = await self.wait_stream(stream_id)
+        if status != STATUS_OK:
+            raise Exception(f"Failed to write remote file: {remote_path}")
+
+        return self.tool_success(f"Downloaded {len(content)} bytes\nFrom host: {host_path}\nTo remote: {remote_path}")
+
+    # =========================================================================
+    # Cleanup
+    # =========================================================================
 
     def cleanup(self):
         """Clean up resources."""
@@ -1498,23 +1527,29 @@ COMMAND TIMEOUTS:
                 pass
             self.master_fd = None
 
+        self.pending_streams.clear()
+        self.stream_data.clear()
+        self.next_stream_id = 0
+
+
+# =============================================================================
+# Main
+# =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Claude Telepresence Relay')
-    parser.add_argument('--host', default='0.0.0.0', help='Host to bind to')
-    parser.add_argument('--port', '-p', type=int, default=5000, help='Port to listen on')
-    parser.add_argument('--mcp-port', type=int, default=5001,
-                        help='MCP server port (default: 5001)')
-    parser.add_argument('--claude', '-c', default='claude',
-                        help='Claude Code command to run (default: claude)')
+    parser = argparse.ArgumentParser(description='Claude Telepresence Relay v2')
+    parser.add_argument('--host', default='0.0.0.0', help='Host to bind')
+    parser.add_argument('--port', '-p', type=int, default=5000, help='TCP port')
+    parser.add_argument('--mcp-port', type=int, default=5001, help='MCP port')
+    parser.add_argument('--claude', '-c', default='claude', help='Claude command')
     args = parser.parse_args()
 
-    relay = TelepresenceRelay(args.host, args.port, args.claude, args.mcp_port)
+    relay = RelayV2(args.host, args.port, args.mcp_port, args.claude)
 
     try:
         asyncio.run(relay.start())
     except KeyboardInterrupt:
-        print("\n[relay] Shutting down...")
+        print("\nShutting down...")
 
 
 if __name__ == '__main__':

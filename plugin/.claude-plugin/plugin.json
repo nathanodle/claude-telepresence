@@ -1,5 +1,0 @@
-{
-  "name": "telepresence",
-  "version": "1.0.0",
-  "description": "Proxies Bash commands to a remote machine via telepresence relay"
-}

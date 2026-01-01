@@ -1,18 +1,15 @@
 /*
- * claude-telepresence client
+ * claude-telepresence client v2
  *
- * Thin client for legacy Unix systems (HP-UX, IRIX, NeXT, Solaris, etc.)
- * Connects to relay server, handles terminal I/O, executes operations locally.
- *
- * Written in C89 for maximum portability.
+ * Binary streaming protocol client for legacy Unix systems.
+ * Written in K&R C for maximum portability.
  *
  * Build:
- *   HP-UX:   cc -o claude-telepresence client.c -lsocket -lnsl
- *   IRIX:    cc -o claude-telepresence client.c
- *   Solaris: cc -o claude-telepresence client.c -lsocket -lnsl
- *   Linux:   gcc -o claude-telepresence client.c
- *   NeXT:    cc -o claude-telepresence client.c
- *   AIX:     cc -o claude-telepresence client.c
+ *   HP-UX (K&R):  cc -o claude-telepresence client_v2.c
+ *   HP-UX (ANSI): cc -Aa -o claude-telepresence client_v2.c
+ *   Solaris:      cc -o claude-telepresence client_v2.c -lsocket -lnsl
+ *   IRIX/AIX:     cc -o claude-telepresence client_v2.c
+ *   Linux:        gcc -o claude-telepresence client_v2.c
  */
 
 #include <stdio.h>
@@ -29,13 +26,12 @@
 #include <sys/wait.h>
 #include <sys/ioctl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <time.h>
 
-/* Platform-specific headers */
-/* NeXT uses sgtty instead of termios, and sys/dir.h instead of dirent.h */
-/* Modern macOS defines __APPLE__ along with __MACH__, NeXTSTEP doesn't */
+/* Platform-specific terminal handling */
 #if (defined(NeXT) || defined(__NeXT__)) || (defined(__MACH__) && !defined(__APPLE__))
 #define NEXT_COMPAT 1
 #include <libc.h>
@@ -43,7 +39,9 @@
 #include <sgtty.h>
 #define dirent direct
 #else
+#ifndef __hpux
 #include <sys/select.h>
+#endif
 #include <termios.h>
 #include <dirent.h>
 #endif
@@ -52,8 +50,7 @@
 #include <sys/termios.h>
 #endif
 
-/* NeXT compatibility - missing POSIX macros and functions */
-#ifdef NEXT_COMPAT
+/* POSIX macros for older systems */
 #ifndef S_ISDIR
 #define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
 #endif
@@ -63,48 +60,126 @@
 #ifndef S_ISLNK
 #define S_ISLNK(m) (((m) & S_IFMT) == S_IFLNK)
 #endif
-#endif
 
-/* snprintf compatibility for NeXTSTEP and other vintage Unix systems.
- *
- * IMPORTANT: This shim uses vsprintf which has NO bounds checking.
- * Unlike real snprintf, this WILL overflow if output exceeds size.
- *
- * Safety is ensured by auditing all call sites in this codebase:
- * - readFile: file size capped at 7MB, base64 fits in 10MB buffer
- * - cp.exec: output capped at 4MB, escaped fits in 10MB buffer
- * - readdir: full_path buffer increased to MAX_PATH+256
- * - search: match buffers increased to 8KB/16KB
- * - All other calls use fixed-format strings with bounded output
- *
- * The shim guarantees null-termination if overflow is detected after
- * the fact, but by then memory corruption has already occurred.
- * DO NOT add new snprintf calls without verifying buffer adequacy. */
-#ifdef NEXT_COMPAT
-#include <stdarg.h>
-static int snprintf(char *buf, size_t size, const char *fmt, ...) {
-    va_list ap;
-    int ret;
+/* ============================================================================
+ * Protocol Constants (from PROTOCOL_V2.md)
+ * ============================================================================ */
 
-    if (size == 0) return 0;
+#define PROTO_VERSION       2
 
-    va_start(ap, fmt);
-    ret = vsprintf(buf, fmt, ap);
-    va_end(ap);
+/* Packet types - Control */
+#define PKT_HELLO           0x00
+#define PKT_HELLO_ACK       0x01
+#define PKT_PING            0x0E
+#define PKT_PONG            0x0F
+#define PKT_GOODBYE         0x0D
 
-    /* Null-terminate if we can detect overflow (too late, but helps debugging) */
-    if (ret >= (int)size) {
-        buf[size - 1] = '\0';
-    }
-    return ret;
-}
-#endif
+/* Packet types - Terminal */
+#define PKT_TERM_INPUT      0x10
+#define PKT_TERM_OUTPUT     0x11
+#define PKT_TERM_RESIZE     0x12
 
-#define BUFFER_SIZE (10 * 1024 * 1024)  /* 10MB buffer for large files */
-#define MAX_PATH 4096
+/* Packet types - Streams */
+#define PKT_STREAM_OPEN     0x20
+#define PKT_STREAM_DATA     0x21
+#define PKT_STREAM_END      0x22
+#define PKT_STREAM_ERROR    0x23
+#define PKT_STREAM_CANCEL   0x24
+
+/* Packet types - Flow control */
+#define PKT_WINDOW_UPDATE   0x28
+
+/* Stream types */
+#define STREAM_FILE_READ    0x01
+#define STREAM_FILE_WRITE   0x02
+#define STREAM_EXEC         0x03
+#define STREAM_DIR_LIST     0x04
+#define STREAM_FILE_STAT    0x05
+#define STREAM_FILE_FIND    0x06
+#define STREAM_FILE_SEARCH  0x07
+#define STREAM_MKDIR        0x08
+#define STREAM_REMOVE       0x09
+#define STREAM_MOVE         0x0A
+#define STREAM_FILE_EXISTS  0x0B
+#define STREAM_REALPATH     0x0C
+
+/* EXEC channels */
+#define CHAN_STDOUT         0x01
+#define CHAN_STDERR         0x02
+
+/* Stream end status */
+#define STATUS_OK           0x00
+#define STATUS_ERROR        0x01
+#define STATUS_CANCELLED    0x02
+
+/* EXEC exit status */
+#define EXIT_NORMAL         0x00
+#define EXIT_SIGNAL         0x01
+#define EXIT_TIMEOUT        0x02
+#define EXIT_UNKNOWN        0xFF
+
+/* Error codes */
+#define ERR_NOT_FOUND       0x01
+#define ERR_PERMISSION      0x02
+#define ERR_IO_ERROR        0x03
+#define ERR_TIMEOUT         0x04
+#define ERR_CANCELLED       0x05
+#define ERR_NO_MEMORY       0x06
+#define ERR_INVALID         0x07
+#define ERR_EXISTS          0x08
+#define ERR_NOT_DIR         0x09
+#define ERR_IS_DIR          0x0A
+#define ERR_UNKNOWN         0xFF
+
+/* HELLO flags */
+#define FLAG_RESUME         0x01
+#define FLAG_SIMPLE         0x02
+
+/* GOODBYE reasons */
+#define BYE_NORMAL          0x00
+#define BYE_PROTOCOL_ERROR  0x01
+#define BYE_TIMEOUT         0x02
+#define BYE_RESOURCE        0x03
+#define BYE_UNKNOWN         0xFF
+
+/* Limits */
+#define MAX_PACKET_SIZE     (1 * 1024 * 1024)   /* 1 MB - safe for legacy systems */
+#define MAX_PATH            4096
+#define MAX_STREAMS         256
+#define DEFAULT_WINDOW      (256 * 1024)        /* 256 KB */
+#define MIN_WINDOW          (16 * 1024)         /* 16 KB */
+#define CHUNK_SIZE          (64 * 1024)         /* 64 KB for file I/O */
+#define SMALL_CHUNK         4096                /* 4 KB for exec output */
+
+/* ============================================================================
+ * Data Structures
+ * ============================================================================ */
+
+/* Stream state */
+#define STREAM_STATE_IDLE       0
+#define STREAM_STATE_OPEN       1
+#define STREAM_STATE_HALF_LOCAL 2   /* We sent END, waiting for peer */
+#define STREAM_STATE_HALF_REMOTE 3  /* Peer sent END, we still sending */
+#define STREAM_STATE_CLOSED     4
+
+struct stream {
+    unsigned long id;
+    int state;
+    int type;
+    int child_pid;      /* For EXEC streams */
+    int child_fd;       /* Pipe to child stdout/stderr */
+    FILE *file_fp;      /* For file read/write */
+    DIR *dir_ptr;       /* For directory listing */
+};
 
 /* Global state */
 static int sockfd = -1;
+static int simple_mode = 0;
+static int resume_mode = 0;
+static int raw_mode = 0;
+static FILE *logfile = NULL;
+
+/* Terminal state */
 #ifdef NEXT_COMPAT
 static struct sgttyb orig_sgttyb;
 static struct tchars orig_tchars;
@@ -113,31 +188,617 @@ static int orig_lmode;
 #else
 static struct termios orig_termios;
 #endif
-static int raw_mode = 0;
-static int simple_mode = 0;  /* Filter fancy terminal effects */
-static int resume_mode = 0;  /* Resume previous session */
-static FILE *logfile = NULL; /* Debug log */
 
-/* Buffers */
-static char *recv_buffer = NULL;
-static char *send_buffer = NULL;
-static char *json_buffer = NULL;
-static char *result_buffer = NULL;
+/* Flow control */
+static unsigned long send_window = DEFAULT_WINDOW;
+static unsigned long recv_window = DEFAULT_WINDOW;
+static unsigned long bytes_in_flight = 0;
+static unsigned long bytes_to_ack = 0;  /* Bytes received, not yet acknowledged */
+#define WINDOW_UPDATE_THRESHOLD 8192  /* Send update every 8KB for responsiveness */
+
+/* Receive buffer for packet reassembly */
+static unsigned char *recv_buf = NULL;
+static int recv_buf_len = 0;
+static int recv_buf_cap = 0;
+
+/* Stream table - odd IDs only (client-initiated would be odd, but we mostly receive) */
+static struct stream streams[MAX_STREAMS];
+/* static int next_stream_id = 1; */  /* Client uses odd IDs - for future use */
+
+/* Working directory from HELLO */
+static char remote_cwd[MAX_PATH];
 
 /* Signal handling */
-static volatile sig_atomic_t got_sigwinch = 0;
+static int got_sigwinch = 0;
 
-static void sigwinch_handler(int sig) {
-    (void)sig;
+static void sigwinch_handler(sig)
+int sig;
+{
     got_sigwinch = 1;
 }
 
 /* ============================================================================
- * Terminal handling
+ * Simple Mode Filter
+ *
+ * Strips SGR (color) sequences, converts UTF-8 to ASCII.
+ * State machine handles sequences split across packet boundaries.
+ * In-place filtering - output always <= input.
+ * ============================================================================ */
+
+/* Filter states */
+#define FLT_NORMAL  0
+#define FLT_ESC     1
+#define FLT_CSI     2
+#define FLT_UTF8    3
+
+/* Filter state - persists across packets */
+static struct {
+    int state;
+    unsigned char seq[32];
+    int seq_len;
+    int utf8_need;
+    int spinner;
+} flt = { FLT_NORMAL, {0}, 0, 0, 0 };
+
+static char spinner_chars[4] = { '-', '\\', '|', '/' };
+
+/*
+ * Convert completed UTF-8 sequence to ASCII.
+ * Returns ASCII character based on mapping tables in spec.
+ */
+static int utf8_to_ascii(seq, len)
+unsigned char *seq;
+int len;
+{
+    unsigned char b0, b1, b2;
+
+    if (len < 2) return '?';
+
+    b0 = seq[0];
+    b1 = seq[1];
+
+    /* 2-byte sequences (C2/C3 xx) */
+    if (len == 2) {
+        if (b0 == 0xC2) {
+            if (b1 == 0xA0) return ' ';           /* NBSP */
+            if (b1 == 0xB7) {                     /* middle dot - spinner */
+                return spinner_chars[flt.spinner++ & 3];
+            }
+        }
+        return '?';
+    }
+
+    /* 3-byte sequences (E2 xx xx) */
+    if (len == 3 && b0 == 0xE2) {
+        b2 = seq[2];
+
+        /* Box drawing E2 94 xx, E2 95 xx */
+        if (b1 == 0x94) {
+            /* Check vertical first (82, 83) before horizontal range */
+            if (b2 == 0x82 || b2 == 0x83) return '|';
+            if (b2 == 0x80 || b2 == 0x81 || b2 == 0x84) return '-';
+            return '+';
+        }
+        if (b1 == 0x95) {
+            if (b2 >= 0x90 && b2 <= 0x94) return '=';
+            return '+';
+        }
+
+        /* Arrows E2 86 xx */
+        if (b1 == 0x86) {
+            if (b2 == 0x90) return '<';
+            if (b2 == 0x91) return '^';
+            if (b2 == 0x92) return '>';
+            if (b2 == 0x93) return 'v';
+            return '>';
+        }
+
+        /* Geometric shapes E2 96 xx */
+        if (b1 == 0x96) {
+            if (b2 >= 0xB2 && b2 <= 0xB5) return '^';
+            if (b2 >= 0xB6 && b2 <= 0xB9) return '>';
+            if (b2 >= 0xBA && b2 <= 0xBD) return 'v';
+            return '*';
+        }
+
+        /* Geometric shapes E2 97 xx */
+        if (b1 == 0x97) {
+            if (b2 >= 0x80 && b2 <= 0x83) return '<';
+            if (b2 == 0x8F) {  /* black circle - spinner */
+                return spinner_chars[flt.spinner++ & 3];
+            }
+            if (b2 == 0x8B) return 'o';
+            if (b2 == 0x86 || b2 == 0x87) return '*';
+            return '*';
+        }
+
+        /* Dingbats E2 9C xx */
+        if (b1 == 0x9C) {
+            if (b2 == 0x93 || b2 == 0x94) return '+';  /* checkmarks */
+            if (b2 == 0x85) return '+';                /* heavy check */
+            if (b2 == 0x97 || b2 == 0x98) return 'x';  /* X marks */
+            /* Stars - spinner */
+            if (b2 == 0xA2 || b2 == 0xB3 || b2 == 0xB6 ||
+                b2 == 0xBB || b2 == 0xBD) {
+                return spinner_chars[flt.spinner++ & 3];
+            }
+            return '*';
+        }
+
+        /* Dingbats E2 9D xx */
+        if (b1 == 0x9D) {
+            if (b2 == 0x8C) return 'x';  /* cross mark */
+            return '*';
+        }
+
+        /* Heavy arrows E2 9E xx */
+        if (b1 == 0x9E) {
+            return '>';
+        }
+
+        /* Math operators E2 88 xx */
+        if (b1 == 0x88) {
+            if (b2 == 0xB4) {  /* therefore - spinner */
+                return spinner_chars[flt.spinner++ & 3];
+            }
+            return '*';
+        }
+
+        /* Technical symbols E2 8C-8F xx */
+        if (b1 >= 0x8C && b1 <= 0x8F) {
+            return '>';
+        }
+
+        /* General punctuation E2 80 xx */
+        if (b1 == 0x80) {
+            if (b2 == 0xA2) return '*';                /* bullet */
+            if (b2 == 0xA3) return '>';                /* triangular bullet */
+            if (b2 >= 0x93 && b2 <= 0x95) return '-';  /* dashes */
+            if (b2 == 0x98 || b2 == 0x99) return '\''; /* single quotes */
+            if (b2 == 0x9C || b2 == 0x9D) return '"';  /* double quotes */
+            if (b2 == 0xA6) return '.';                /* ellipsis */
+            if (b2 == 0xB9) return '<';                /* left angle */
+            if (b2 == 0xBA) return '>';                /* right angle */
+            return ' ';
+        }
+
+        return '?';
+    }
+
+    /* 4-byte sequences (F0 xx xx xx) - emoji */
+    if (len == 4 && b0 == 0xF0) {
+        if (b1 == 0x9F) return '*';  /* emoji */
+        return '?';
+    }
+
+    return '?';
+}
+
+/*
+ * Filter terminal output in-place for simple mode.
+ * Returns new length (always <= original).
+ * State persists across calls for split sequences.
+ */
+static int filter_simple(buf, len)
+unsigned char *buf;
+int len;
+{
+    unsigned char *r, *w, *end;
+    unsigned char c;
+    int i;
+
+    if (len <= 0) return 0;
+
+    r = buf;
+    w = buf;
+    end = buf + len;
+
+    while (r < end) {
+        c = *r++;
+
+        switch (flt.state) {
+
+        case FLT_NORMAL:
+            if (c == 0x1B) {
+                /* ESC - start escape sequence */
+                flt.state = FLT_ESC;
+                flt.seq[0] = c;
+                flt.seq_len = 1;
+            } else if (c < 0x80) {
+                /* ASCII - pass through */
+                *w++ = c;
+            } else if ((c & 0xE0) == 0xC0) {
+                /* 2-byte UTF-8 start */
+                flt.state = FLT_UTF8;
+                flt.seq[0] = c;
+                flt.seq_len = 1;
+                flt.utf8_need = 1;
+            } else if ((c & 0xF0) == 0xE0) {
+                /* 3-byte UTF-8 start */
+                flt.state = FLT_UTF8;
+                flt.seq[0] = c;
+                flt.seq_len = 1;
+                flt.utf8_need = 2;
+            } else if ((c & 0xF8) == 0xF0) {
+                /* 4-byte UTF-8 start */
+                flt.state = FLT_UTF8;
+                flt.seq[0] = c;
+                flt.seq_len = 1;
+                flt.utf8_need = 3;
+            } else {
+                /* Invalid UTF-8 start byte */
+                *w++ = '?';
+            }
+            break;
+
+        case FLT_ESC:
+            flt.seq[flt.seq_len++] = c;
+            if (c == '[') {
+                /* CSI sequence */
+                flt.state = FLT_CSI;
+            } else {
+                /* Non-CSI escape - pass through */
+                for (i = 0; i < flt.seq_len; i++) {
+                    *w++ = flt.seq[i];
+                }
+                flt.state = FLT_NORMAL;
+                flt.seq_len = 0;
+            }
+            break;
+
+        case FLT_CSI:
+            if (c < 0x20) {
+                /* Control character - execute immediately, stay in CSI state */
+                /* This handles BS, CR, LF, etc. during escape sequences */
+                *w++ = c;
+            } else if (c >= 0x40 && c <= 0x7E) {
+                /* Command byte - end of CSI */
+                flt.seq[flt.seq_len++] = c;
+                if (c == 'm') {
+                    /* SGR (color) - discard */
+                } else {
+                    /* Other CSI - pass through */
+                    for (i = 0; i < flt.seq_len; i++) {
+                        *w++ = flt.seq[i];
+                    }
+                }
+                flt.state = FLT_NORMAL;
+                flt.seq_len = 0;
+            } else if (flt.seq_len >= 30) {
+                /* Too long - flush and reset */
+                for (i = 0; i < flt.seq_len; i++) {
+                    *w++ = flt.seq[i];
+                }
+                flt.state = FLT_NORMAL;
+                flt.seq_len = 0;
+            } else {
+                /* Parameter/intermediate byte (0x20-0x3F) - accumulate */
+                flt.seq[flt.seq_len++] = c;
+            }
+            break;
+
+        case FLT_UTF8:
+            if ((c & 0xC0) == 0x80) {
+                /* Valid continuation byte */
+                flt.seq[flt.seq_len++] = c;
+                flt.utf8_need--;
+                if (flt.utf8_need == 0) {
+                    /* Complete - convert to ASCII */
+                    *w++ = utf8_to_ascii(flt.seq, flt.seq_len);
+                    flt.state = FLT_NORMAL;
+                    flt.seq_len = 0;
+                }
+            } else {
+                /* Invalid continuation - output ? and reprocess */
+                *w++ = '?';
+                flt.state = FLT_NORMAL;
+                flt.seq_len = 0;
+                r--;  /* Back up to reprocess this byte */
+            }
+            break;
+        }
+    }
+
+    return w - buf;
+}
+
+/* ============================================================================
+ * Logging
+ * ============================================================================ */
+
+static void log_packet(direction, type, length)
+char *direction;
+int type;
+int length;
+{
+    char *name;
+    if (!logfile) return;
+
+    switch (type) {
+        case PKT_HELLO:         name = "HELLO"; break;
+        case PKT_HELLO_ACK:     name = "HELLO_ACK"; break;
+        case PKT_PING:          name = "PING"; break;
+        case PKT_PONG:          name = "PONG"; break;
+        case PKT_GOODBYE:       name = "GOODBYE"; break;
+        case PKT_TERM_INPUT:    name = "TERM_INPUT"; break;
+        case PKT_TERM_OUTPUT:   name = "TERM_OUTPUT"; break;
+        case PKT_TERM_RESIZE:   name = "TERM_RESIZE"; break;
+        case PKT_STREAM_OPEN:   name = "STREAM_OPEN"; break;
+        case PKT_STREAM_DATA:   name = "STREAM_DATA"; break;
+        case PKT_STREAM_END:    name = "STREAM_END"; break;
+        case PKT_STREAM_ERROR:  name = "STREAM_ERROR"; break;
+        case PKT_STREAM_CANCEL: name = "STREAM_CANCEL"; break;
+        case PKT_WINDOW_UPDATE: name = "WINDOW_UPDATE"; break;
+        default:                name = "UNKNOWN"; break;
+    }
+    fprintf(logfile, "[%s] %s (0x%02X) len=%d\n", direction, name, type, length);
+    fflush(logfile);
+}
+
+/* ============================================================================
+ * Byte Order Helpers
+ * ============================================================================ */
+
+static unsigned long get_u32(buf)
+unsigned char *buf;
+{
+    return ((unsigned long)buf[0] << 24) |
+           ((unsigned long)buf[1] << 16) |
+           ((unsigned long)buf[2] << 8) |
+           (unsigned long)buf[3];
+}
+
+static void put_u32(buf, val)
+unsigned char *buf;
+unsigned long val;
+{
+    buf[0] = (val >> 24) & 0xFF;
+    buf[1] = (val >> 16) & 0xFF;
+    buf[2] = (val >> 8) & 0xFF;
+    buf[3] = val & 0xFF;
+}
+
+static unsigned int get_u16(buf)
+unsigned char *buf;
+{
+    return ((unsigned int)buf[0] << 8) | (unsigned int)buf[1];
+}
+
+static void put_u16(buf, val)
+unsigned char *buf;
+unsigned int val;
+{
+    buf[0] = (val >> 8) & 0xFF;
+    buf[1] = val & 0xFF;
+}
+
+/* ============================================================================
+ * Packet I/O
+ * ============================================================================ */
+
+/*
+ * Send a packet. Returns 0 on success, -1 on error.
+ */
+static int send_packet(type, payload, length)
+int type;
+unsigned char *payload;
+int length;
+{
+    unsigned char header[5];
+    int sent, n;
+
+    if (length > MAX_PACKET_SIZE) {
+        if (logfile) fprintf(logfile, "[ERROR] Packet too large: %d\n", length);
+        return -1;
+    }
+
+    header[0] = type;
+    put_u32(header + 1, (unsigned long)length);
+
+    /* Send header */
+    sent = 0;
+    while (sent < 5) {
+        n = write(sockfd, header + sent, 5 - sent);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                /* Would block, wait for socket to be writable */
+                fd_set wfds;
+                FD_ZERO(&wfds);
+                FD_SET(sockfd, &wfds);
+                select(sockfd + 1, NULL, &wfds, NULL, NULL);
+                continue;
+            }
+            return -1;
+        }
+        if (n == 0) return -1;
+        sent += n;
+    }
+
+    /* Send payload */
+    if (length > 0 && payload != NULL) {
+        sent = 0;
+        while (sent < length) {
+            n = write(sockfd, payload + sent, length - sent);
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    fd_set wfds;
+                    FD_ZERO(&wfds);
+                    FD_SET(sockfd, &wfds);
+                    select(sockfd + 1, NULL, &wfds, NULL, NULL);
+                    continue;
+                }
+                return -1;
+            }
+            if (n == 0) return -1;
+            sent += n;
+        }
+    }
+
+    log_packet("SEND", type, length);
+    return 0;
+}
+
+/*
+ * Try to read a complete packet from the socket.
+ * Returns packet type on success, -1 on error, 0 if incomplete.
+ * Payload and length are set on success.
+ */
+static int recv_packet(payload, length)
+unsigned char **payload;
+int *length;
+{
+    unsigned char tmp[4096];
+    int n, pkt_len, total_needed;
+    unsigned char type;
+
+    /* Read available data into buffer */
+    n = read(sockfd, tmp, sizeof(tmp));
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            n = 0;  /* No data available */
+        } else {
+            return -1;  /* Error */
+        }
+    } else if (n == 0) {
+        return -1;  /* Connection closed */
+    }
+
+    /* Append to receive buffer */
+    if (n > 0) {
+        if (recv_buf_len + n > recv_buf_cap) {
+            int new_cap = recv_buf_cap ? recv_buf_cap * 2 : 8192;
+            unsigned char *new_buf;
+            while (new_cap < recv_buf_len + n) new_cap *= 2;
+            if (new_cap > MAX_PACKET_SIZE + 5) new_cap = MAX_PACKET_SIZE + 5;
+            new_buf = realloc(recv_buf, new_cap);
+            if (!new_buf) return -1;
+            recv_buf = new_buf;
+            recv_buf_cap = new_cap;
+        }
+        memcpy(recv_buf + recv_buf_len, tmp, n);
+        recv_buf_len += n;
+    }
+
+    /* Check if we have a complete packet */
+    if (recv_buf_len < 5) return 0;  /* Need header */
+
+    type = recv_buf[0];
+    pkt_len = (int)get_u32(recv_buf + 1);
+
+    if (pkt_len > MAX_PACKET_SIZE) {
+        if (logfile) fprintf(logfile, "[ERROR] Received packet too large: %d\n", pkt_len);
+        return -1;  /* Protocol error */
+    }
+
+    total_needed = 5 + pkt_len;
+    if (recv_buf_len < total_needed) return 0;  /* Need more data */
+
+    /* Complete packet available */
+    *payload = recv_buf + 5;
+    *length = pkt_len;
+
+    log_packet("RECV", type, pkt_len);
+    return type;
+}
+
+/*
+ * Consume a packet from the receive buffer after processing.
+ */
+static void consume_packet(length)
+int length;
+{
+    int total = 5 + length;
+    if (recv_buf_len > total) {
+        memmove(recv_buf, recv_buf + total, recv_buf_len - total);
+    }
+    recv_buf_len -= total;
+}
+
+/*
+ * Wait for send window to have space for 'needed' bytes.
+ * Polls socket for WINDOW_UPDATE packets.
+ * Returns 0 on success, -1 on error.
+ */
+static int wait_for_send_window(needed)
+unsigned long needed;
+{
+    fd_set readfds;
+    struct timeval tv;
+    unsigned char *payload;
+    int length, type;
+
+    while (bytes_in_flight + needed > send_window) {
+        /* Need to wait for WINDOW_UPDATE */
+        FD_ZERO(&readfds);
+        FD_SET(sockfd, &readfds);
+        tv.tv_sec = 30;  /* 30 second timeout */
+        tv.tv_usec = 0;
+
+        if (select(sockfd + 1, &readfds, NULL, NULL, &tv) <= 0) {
+            return -1;  /* Timeout or error */
+        }
+
+        type = recv_packet(&payload, &length);
+        if (type < 0) return -1;
+        if (type == 0) continue;  /* No complete packet yet */
+
+        if (type == PKT_WINDOW_UPDATE && length >= 4) {
+            unsigned long increment = get_u32(payload);
+            if (bytes_in_flight >= increment) {
+                bytes_in_flight -= increment;
+            } else {
+                bytes_in_flight = 0;
+            }
+            if (logfile) {
+                fprintf(logfile, "[FLOW] Window update +%lu, in_flight=%lu\n",
+                        increment, bytes_in_flight);
+            }
+        } else if (type == PKT_PING) {
+            /* Respond to PING while waiting */
+            send_packet(PKT_PONG, payload, length);
+        } else if (type == PKT_GOODBYE) {
+            return -1;
+        }
+        /* Ignore other packets while waiting for window */
+
+        consume_packet(length);
+    }
+
+    return 0;
+}
+
+/*
+ * Send stream data with flow control.
+ * Waits for window space, sends, and tracks bytes_in_flight.
+ * Returns 0 on success, -1 on error.
+ */
+static int send_stream_data_fc(buf, len)
+unsigned char *buf;
+int len;
+{
+    /* Wait for window space */
+    if (wait_for_send_window((unsigned long)len) < 0) {
+        return -1;
+    }
+
+    /* Send the packet */
+    if (send_packet(PKT_STREAM_DATA, buf, len) < 0) {
+        return -1;
+    }
+
+    /* Track bytes in flight */
+    bytes_in_flight += len;
+
+    return 0;
+}
+
+/* ============================================================================
+ * Terminal Handling
  * ============================================================================ */
 
 #ifdef NEXT_COMPAT
-static void disable_raw_mode(void) {
+static void disable_raw_mode()
+{
     if (raw_mode) {
         ioctl(STDIN_FILENO, TIOCSETP, &orig_sgttyb);
         ioctl(STDIN_FILENO, TIOCSETC, &orig_tchars);
@@ -147,7 +808,8 @@ static void disable_raw_mode(void) {
     }
 }
 
-static void enable_raw_mode(void) {
+static void enable_raw_mode()
+{
     struct sgttyb raw_sgttyb;
     struct tchars raw_tchars;
     struct ltchars raw_ltchars;
@@ -162,7 +824,6 @@ static void enable_raw_mode(void) {
     raw_sgttyb.sg_flags |= RAW;
     raw_sgttyb.sg_flags &= ~ECHO;
 
-    /* Disable special characters */
     memset(&raw_tchars, -1, sizeof(raw_tchars));
     memset(&raw_ltchars, -1, sizeof(raw_ltchars));
     lmode = orig_lmode;
@@ -176,14 +837,16 @@ static void enable_raw_mode(void) {
     atexit(disable_raw_mode);
 }
 #else
-static void disable_raw_mode(void) {
+static void disable_raw_mode()
+{
     if (raw_mode) {
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
         raw_mode = 0;
     }
 }
 
-static void enable_raw_mode(void) {
+static void enable_raw_mode()
+{
     struct termios raw;
 
     if (tcgetattr(STDIN_FILENO, &orig_termios) == -1) return;
@@ -203,7 +866,10 @@ static void enable_raw_mode(void) {
 }
 #endif
 
-static void get_terminal_size(int *rows, int *cols) {
+static void get_terminal_size(rows, cols)
+int *rows;
+int *cols;
+{
 #ifdef TIOCGWINSZ
     struct winsize ws;
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
@@ -216,441 +882,14 @@ static void get_terminal_size(int *rows, int *cols) {
     *cols = 80;
 }
 
-/* Spinner state for animated -\|/ */
-static int spinner_state = 0;
-static const char spinner_chars[] = "-\\|/";
-
-/* Filter for simple mode: convert Unicode to ASCII and strip color codes */
-static size_t filter_terminal_output(const char *in, char *out, size_t outlen) {
-    const unsigned char *p = (const unsigned char *)in;
-    size_t inlen = strlen(in);
-    size_t j = 0;
-    size_t i = 0;
-    unsigned char c, ch, cmd;
-    size_t start;
-    int looks_like_sgr, has_question;
-
-    while (i < inlen && j < outlen - 1) {
-        c = p[i];
-
-        /* Handle ESC sequences - strip colors, keep everything else */
-        if (c == 0x1b && (i + 1) < inlen && p[i + 1] == '[') {
-            /* CSI sequence: ESC [ params command */
-            start = i;
-            i += 2;  /* skip ESC [ */
-
-            /* Check if this looks like SGR (color) - only digits, semicolons, and 'm' */
-            looks_like_sgr = 1;
-            has_question = 0;
-
-            /* Scan for command letter */
-            while (i < inlen && p[i] >= 0x20 && p[i] < 0x40) {
-                ch = p[i];
-                /* SGR uses digits, semicolons, and colons (for extended color syntax) */
-                /* If we see ? or other chars, it's not SGR */
-                if (ch == '?') has_question = 1;
-                if (ch != ';' && ch != ':' && (ch < '0' || ch > '9')) {
-                    looks_like_sgr = 0;
-                }
-                i++;
-            }
-
-            if (i >= inlen) {
-                /* Incomplete sequence at end */
-                if (looks_like_sgr && !has_question) {
-                    /* Probably a color code - discard */
-                    break;
-                }
-                /* Otherwise pass through */
-                while (start < inlen && j < outlen - 1) {
-                    out[j++] = p[start++];
-                }
-                break;
-            }
-
-            cmd = p[i++];
-
-            /* Strip SGR (color/formatting) which ends with 'm' */
-            if (cmd == 'm') {
-                /* Skip - don't copy */
-            } else {
-                /* Copy the whole sequence */
-                while (start < i && j < outlen - 1) {
-                    out[j++] = p[start++];
-                }
-            }
-            continue;
-        }
-
-        /* Pass through other ASCII */
-        if (c < 0x80) {
-            out[j++] = c;
-            i++;
-            continue;
-        }
-
-        /* Handle UTF-8 sequences - convert known ones to ASCII */
-
-        /* 3-byte UTF-8: E2 xx xx - includes box drawing, arrows, symbols */
-        if (c == 0xE2 && (i + 2) < inlen) {
-            unsigned char b1 = p[i + 1];
-            unsigned char b2 = p[i + 2];
-
-            /* Box drawing U+2500-U+257F (E2 94 80 - E2 95 BF) */
-            if (b1 == 0x94) {
-                /* Light box drawing */
-                if (b2 >= 0x80 && b2 <= 0x84) out[j++] = '-';      /* horizontal lines */
-                else if (b2 >= 0x82 && b2 <= 0x83) out[j++] = '|'; /* vertical lines */
-                else out[j++] = '+';                               /* corners, etc */
-                i += 3;
-                continue;
-            }
-            if (b1 == 0x95) {
-                /* Heavy/double box drawing */
-                if (b2 >= 0x90 && b2 <= 0x94) out[j++] = '=';      /* double horizontal */
-                else if (b2 >= 0x91 && b2 <= 0x93) out[j++] = '|'; /* double vertical */
-                /* Rounded corners E2 95 AD-B0 */
-                else out[j++] = '+';
-                i += 3;
-                continue;
-            }
-
-            /* Arrows U+2190-U+21FF (E2 86 xx) */
-            if (b1 == 0x86) {
-                if (b2 == 0x90) out[j++] = '<';       /* ← leftwards arrow */
-                else if (b2 == 0x91) out[j++] = '^';  /* ↑ upwards arrow */
-                else if (b2 == 0x92) out[j++] = '>';  /* → rightwards arrow */
-                else if (b2 == 0x93) out[j++] = 'v';  /* ↓ downwards arrow */
-                else out[j++] = '>';                  /* other arrows default to > */
-                i += 3;
-                continue;
-            }
-
-            /* Geometric shapes U+25A0-U+25FF (E2 96 xx, E2 97 xx) */
-            if (b1 == 0x96) {
-                if (b2 == 0xB2) out[j++] = '^';       /* ▲ up triangle */
-                else if (b2 == 0xB3) out[j++] = '^';  /* △ white up triangle */
-                else if (b2 == 0xB4) out[j++] = '>';  /* ▴ small up triangle */
-                else if (b2 == 0xB5) out[j++] = '>';  /* ▵ small white up triangle */
-                else if (b2 == 0xB6) out[j++] = '>';  /* ▶ right triangle */
-                else if (b2 == 0xB7) out[j++] = '>';  /* ▷ white right triangle */
-                else if (b2 == 0xB8) out[j++] = '>';  /* ▸ small right triangle */
-                else if (b2 == 0xB9) out[j++] = '>';  /* ▹ small white right triangle */
-                else if (b2 == 0xBA) out[j++] = 'v';  /* ► small down triangle */
-                else if (b2 == 0xBB) out[j++] = 'v';  /* ▻ small white down triangle */
-                else if (b2 == 0xBC) out[j++] = 'v';  /* ▼ down triangle */
-                else if (b2 == 0xBD) out[j++] = 'v';  /* ▽ white down triangle */
-                else out[j++] = '*';                  /* other shapes */
-                i += 3;
-                continue;
-            }
-            if (b1 == 0x97) {
-                if (b2 == 0x80) out[j++] = '<';       /* ◀ left triangle */
-                else if (b2 == 0x81) out[j++] = '<';  /* ◁ white left triangle */
-                else if (b2 == 0x82) out[j++] = '<';  /* ◂ small left triangle */
-                else if (b2 == 0x83) out[j++] = '<';  /* ◃ small white left triangle */
-                else if (b2 == 0x8F) {               /* ● bullet - use as spinner */
-                    out[j++] = spinner_chars[spinner_state];
-                    spinner_state = (spinner_state + 1) & 3;
-                }
-                else if (b2 == 0x8B) out[j++] = 'o';  /* ○ white circle */
-                else if (b2 == 0x86 || b2 == 0x87) out[j++] = '*'; /* ◆◇ diamonds */
-                else out[j++] = '*';                  /* other shapes */
-                i += 3;
-                continue;
-            }
-
-            /* Dingbats - checkmarks, X marks, stars U+2700-U+27BF (E2 9C xx, E2 9D xx) */
-            if (b1 == 0x9C) {
-                /* Checkmarks: ✓ U+2713 (E2 9C 93), ✔ U+2714 (E2 9C 94) */
-                if (b2 == 0x93 || b2 == 0x94) {
-                    out[j++] = '+';
-                    i += 3;
-                    continue;
-                }
-                /* X marks: ✗ U+2717 (E2 9C 97), ✘ U+2718 (E2 9C 98) */
-                if (b2 == 0x97 || b2 == 0x98) {
-                    out[j++] = 'x';
-                    i += 3;
-                    continue;
-                }
-                /* Spinner stars/asterisks - animate! */
-                /* ✢ U+2722 (E2 9C A2), ✳ U+2733 (E2 9C B3), ✶ U+2736 (E2 9C B6) */
-                /* ✻ U+273B (E2 9C BB), ✽ U+273D (E2 9C BD) */
-                if (b2 == 0xA2 || b2 == 0xB3 || b2 == 0xB6 ||
-                    b2 == 0xBB || b2 == 0xBD) {
-                    out[j++] = spinner_chars[spinner_state];
-                    spinner_state = (spinner_state + 1) & 3;
-                    i += 3;
-                    continue;
-                }
-                /* ✅ U+2705 (E2 9C 85) - green checkmark emoji */
-                if (b2 == 0x85) {
-                    out[j++] = '+';
-                    i += 3;
-                    continue;
-                }
-                /* Other dingbats */
-                out[j++] = '*';
-                i += 3;
-                continue;
-            }
-            if (b1 == 0x9D) {
-                /* ❌ U+274C (E2 9D 8C) - red X emoji */
-                if (b2 == 0x8C) {
-                    out[j++] = 'x';
-                    i += 3;
-                    continue;
-                }
-                out[j++] = '*';
-                i += 3;
-                continue;
-            }
-
-            /* Heavy arrows/dingbats U+2780-U+27BF (E2 9E xx) */
-            if (b1 == 0x9E) {
-                /* Most are arrow variants - map to > */
-                /* ➔ U+2794, ➜ U+279C, ➤ U+27A4, etc. */
-                out[j++] = '>';
-                i += 3;
-                continue;
-            }
-
-            /* Mathematical operators U+2200-U+22FF (E2 88 xx) */
-            if (b1 == 0x88) {
-                /* ∴ U+2234 (E2 88 B4) - therefore, used as thinking indicator */
-                if (b2 == 0xB4) {
-                    out[j++] = spinner_chars[spinner_state];
-                    spinner_state = (spinner_state + 1) & 3;
-                    i += 3;
-                    continue;
-                }
-                out[j++] = '*';
-                i += 3;
-                continue;
-            }
-
-            /* Miscellaneous Technical U+2300-U+23FF (E2 8C xx, E2 8D xx, E2 8E xx, E2 8F xx) */
-            if (b1 >= 0x8C && b1 <= 0x8F) {
-                /* Various technical symbols */
-                /* ⎿ U+23BF (E2 8E BF) - used as bye/wave icon */
-                out[j++] = '>';
-                i += 3;
-                continue;
-            }
-
-            /* General punctuation U+2000-U+206F (E2 80 xx) */
-            if (b1 == 0x80) {
-                if (b2 == 0xA2) out[j++] = '*';       /* • bullet */
-                else if (b2 == 0xA3) out[j++] = '>';  /* ‣ triangular bullet */
-                else if (b2 >= 0x93 && b2 <= 0x95) out[j++] = '-'; /* dashes */
-                else if (b2 == 0x98 || b2 == 0x99) out[j++] = '\''; /* ' ' quotes */
-                else if (b2 == 0x9C || b2 == 0x9D) out[j++] = '"';  /* " " quotes */
-                else if (b2 == 0xA6) out[j++] = '.';  /* … ellipsis -> . */
-                else if (b2 == 0xB9) out[j++] = '<';  /* ‹ single angle quote */
-                else if (b2 == 0xBA) out[j++] = '>';  /* › single angle quote */
-                else out[j++] = ' ';
-                i += 3;
-                continue;
-            }
-
-            /* Unknown 3-byte E2 sequence */
-            out[j++] = '?';
-            i += 3;
-            continue;
-        }
-
-        /* 2-byte UTF-8: C2/C3 xx */
-        if ((c == 0xC2 || c == 0xC3) && (i + 1) < inlen) {
-            unsigned char b1 = p[i + 1];
-            if (c == 0xC2 && b1 == 0xA0) {
-                out[j++] = ' ';  /* NBSP */
-            } else if (c == 0xC2 && b1 == 0xB7) {
-                /* · middle dot U+00B7 - use as spinner */
-                out[j++] = spinner_chars[spinner_state];
-                spinner_state = (spinner_state + 1) & 3;
-            } else {
-                /* Other Latin-1 supplement - try to pass through or use ? */
-                out[j++] = '?';
-            }
-            i += 2;
-            continue;
-        }
-
-        /* 4-byte UTF-8: F0 xx xx xx - includes emoji */
-        if (c == 0xF0 && (i + 3) < inlen) {
-            unsigned char b1 = p[i + 1];
-            /* Most emoji are in F0 9F xx xx range */
-            if (b1 == 0x9F) {
-                /* Common emoji mappings */
-                /* 🤖 robot F0 9F A4 96 */
-                /* Just use a generic placeholder for now */
-                out[j++] = '*';
-            } else {
-                out[j++] = '?';
-            }
-            i += 4;
-            continue;
-        }
-
-        /* Other multi-byte UTF-8 - skip with placeholder */
-        if ((c & 0xE0) == 0xC0) { out[j++] = '?'; i += 2; continue; }
-        if ((c & 0xF0) == 0xE0) { out[j++] = '?'; i += 3; continue; }
-        if ((c & 0xF8) == 0xF0) { out[j++] = '?'; i += 4; continue; }
-
-        /* Shouldn't get here, but skip byte */
-        i++;
-    }
-
-    out[j] = '\0';
-    return j;
-}
-
 /* ============================================================================
- * Simple JSON helpers (no external dependencies)
+ * Connection Setup
  * ============================================================================ */
 
-static void json_escape_string(const char *in, char *out, size_t outlen) {
-    size_t i = 0;
-    out[i++] = '"';
-    while (*in && i < outlen - 2) {
-        unsigned char c = (unsigned char)*in;
-        if (c == '"') {
-            if (i + 2 >= outlen - 1) break;
-            out[i++] = '\\'; out[i++] = '"';
-        } else if (c == '\\') {
-            if (i + 2 >= outlen - 1) break;
-            out[i++] = '\\'; out[i++] = '\\';
-        } else if (c == '\n') {
-            if (i + 2 >= outlen - 1) break;
-            out[i++] = '\\'; out[i++] = 'n';
-        } else if (c == '\r') {
-            if (i + 2 >= outlen - 1) break;
-            out[i++] = '\\'; out[i++] = 'r';
-        } else if (c == '\t') {
-            if (i + 2 >= outlen - 1) break;
-            out[i++] = '\\'; out[i++] = 't';
-        } else if (c < 32) {
-            /* Encode other control characters as \uXXXX */
-            if (i + 6 >= outlen - 1) break;
-            out[i++] = '\\';
-            out[i++] = 'u';
-            out[i++] = '0';
-            out[i++] = '0';
-            out[i++] = "0123456789abcdef"[(c >> 4) & 0xf];
-            out[i++] = "0123456789abcdef"[c & 0xf];
-        } else {
-            out[i++] = c;
-        }
-        in++;
-    }
-    out[i++] = '"';
-    out[i] = '\0';
-}
-
-static char *json_get_string(const char *json, const char *key, char *out, size_t outlen) {
-    char search[256];
-    char *start, *end;
-    size_t len;
-
-    snprintf(search, sizeof(search), "\"%s\":", key);
-    start = strstr(json, search);
-    if (!start) {
-        out[0] = '\0';
-        return out;
-    }
-
-    start += strlen(search);
-    while (*start == ' ' || *start == '\t') start++;
-
-    if (*start == '"') {
-        start++;
-        end = start;
-        while (*end && !(*end == '"' && *(end-1) != '\\')) end++;
-        len = end - start;
-        if (len >= outlen) len = outlen - 1;
-        memcpy(out, start, len);
-        out[len] = '\0';
-
-        /* Unescape */
-        {
-            char *r = out, *w = out;
-            while (*r) {
-                if (*r == '\\' && *(r+1)) {
-                    r++;
-                    switch (*r) {
-                        case 'n': *w++ = '\n'; r++; break;
-                        case 'r': *w++ = '\r'; r++; break;
-                        case 't': *w++ = '\t'; r++; break;
-                        case '"': *w++ = '"'; r++; break;
-                        case '\\': *w++ = '\\'; r++; break;
-                        case 'u':
-                            /* Unicode escape \uXXXX */
-                            if (r[1] && r[2] && r[3] && r[4]) {
-                                char hex[5] = {r[1], r[2], r[3], r[4], 0};
-                                unsigned int codepoint = (unsigned int)strtoul(hex, NULL, 16);
-                                if (codepoint < 0x80) {
-                                    *w++ = (char)codepoint;
-                                } else if (codepoint < 0x800) {
-                                    *w++ = (char)(0xC0 | (codepoint >> 6));
-                                    *w++ = (char)(0x80 | (codepoint & 0x3F));
-                                } else {
-                                    *w++ = (char)(0xE0 | (codepoint >> 12));
-                                    *w++ = (char)(0x80 | ((codepoint >> 6) & 0x3F));
-                                    *w++ = (char)(0x80 | (codepoint & 0x3F));
-                                }
-                                r += 5;
-                            } else {
-                                *w++ = *r++;
-                            }
-                            break;
-                        default: *w++ = *r++;
-                    }
-                } else {
-                    *w++ = *r++;
-                }
-            }
-            *w = '\0';
-        }
-    } else {
-        out[0] = '\0';
-    }
-    return out;
-}
-
-static long json_get_int(const char *json, const char *key) {
-    char search[256];
-    char *start;
-
-    snprintf(search, sizeof(search), "\"%s\":", key);
-    start = strstr(json, search);
-    if (!start) return -1;
-
-    start += strlen(search);
-    while (*start == ' ' || *start == '\t') start++;
-
-    return atol(start);
-}
-
-static int json_get_bool(const char *json, const char *key) {
-    char search[256];
-    char *start;
-
-    snprintf(search, sizeof(search), "\"%s\":", key);
-    start = strstr(json, search);
-    if (!start) return 0;
-
-    start += strlen(search);
-    while (*start == ' ' || *start == '\t') start++;
-
-    return (strncmp(start, "true", 4) == 0);
-}
-
-/* ============================================================================
- * Network functions
- * ============================================================================ */
-
-static int connect_to_relay(const char *host, int port) {
+static int connect_to_relay(host, port)
+char *host;
+int port;
+{
     struct hostent *server;
     struct sockaddr_in serv_addr;
     unsigned long addr;
@@ -665,12 +904,10 @@ static int connect_to_relay(const char *host, int port) {
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_port = htons(port);
 
-    /* Try numeric IP first (old gethostbyname doesn't handle IPs) */
     addr = inet_addr(host);
     if (addr != (unsigned long)-1) {
         serv_addr.sin_addr.s_addr = addr;
     } else {
-        /* Fall back to hostname lookup */
         server = gethostbyname(host);
         if (!server) {
             fprintf(stderr, "Cannot resolve host: %s\n", host);
@@ -686,1031 +923,1464 @@ static int connect_to_relay(const char *host, int port) {
         return -1;
     }
 
-    return 0;
-}
-
-static int send_message(const char *json) {
-    size_t len = strlen(json);
-    unsigned char header[4];
-    size_t sent;
-
-    /* Big-endian length header */
-    header[0] = (len >> 24) & 0xFF;
-    header[1] = (len >> 16) & 0xFF;
-    header[2] = (len >> 8) & 0xFF;
-    header[3] = len & 0xFF;
-
-    if (write(sockfd, header, 4) != 4) return -1;
-
-    sent = 0;
-    while (sent < len) {
-        int n = write(sockfd, json + sent, len - sent);
-        if (n <= 0) return -1;
-        sent += n;
+    /* Disable Nagle's algorithm for low-latency interactive use */
+    {
+        int flag = 1;
+        setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(flag));
     }
+
+    /* Set non-blocking mode */
+    fcntl(sockfd, F_SETFL, O_NONBLOCK);
 
     return 0;
 }
 
-static int recv_message(char *buf, size_t buflen) {
-    unsigned char header[4];
-    size_t len, received;
+static int send_hello()
+{
+    unsigned char buf[MAX_PATH + 10];
+    int flags = 0;
+    int len;
 
-    /* Read length header */
-    if (read(sockfd, header, 4) != 4) return -1;
+    if (resume_mode) flags |= FLAG_RESUME;
+    if (simple_mode) flags |= FLAG_SIMPLE;
 
-    len = ((size_t)header[0] << 24) | ((size_t)header[1] << 16) |
-          ((size_t)header[2] << 8) | (size_t)header[3];
-
-    if (len >= buflen) {
-        fprintf(stderr, "Message too large: %lu\n", (unsigned long)len);
-        return -1;
+    /* Get current working directory */
+#ifdef NEXT_COMPAT
+    if (getwd(remote_cwd) == NULL)
+#else
+    if (getcwd(remote_cwd, sizeof(remote_cwd)) == NULL)
+#endif
+    {
+        strcpy(remote_cwd, "/");
     }
 
-    received = 0;
-    while (received < len) {
-        int n = read(sockfd, buf + received, len - received);
-        if (n <= 0) return -1;
-        received += n;
-    }
-    buf[len] = '\0';
+    buf[0] = PROTO_VERSION;
+    buf[1] = flags;
+    put_u32(buf + 2, (unsigned long)recv_window);
+    strcpy((char *)buf + 6, remote_cwd);
+    len = 6 + strlen(remote_cwd) + 1;
 
-    return (int)len;
+    return send_packet(PKT_HELLO, buf, len);
+}
+
+static int wait_for_hello_ack()
+{
+    fd_set fds;
+    struct timeval tv;
+    unsigned char *payload;
+    int length, type;
+    int version, flags;
+    unsigned long window;
+    int timeout_secs = 10;
+
+    while (timeout_secs > 0) {
+        FD_ZERO(&fds);
+        FD_SET(sockfd, &fds);
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+
+        if (select(sockfd + 1, &fds, NULL, NULL, &tv) < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+
+        if (!FD_ISSET(sockfd, &fds)) {
+            timeout_secs--;
+            continue;
+        }
+
+        type = recv_packet(&payload, &length);
+        if (type < 0) return -1;
+        if (type == 0) continue;  /* Incomplete */
+
+        if (type == PKT_HELLO_ACK) {
+            if (length < 6) {
+                fprintf(stderr, "Invalid HELLO_ACK\n");
+                return -1;
+            }
+            version = payload[0];
+            flags = payload[1];
+            window = get_u32(payload + 2);
+
+            if (version != PROTO_VERSION) {
+                fprintf(stderr, "Version mismatch: got %d, expected %d\n",
+                        version, PROTO_VERSION);
+                return -1;
+            }
+
+            send_window = window;
+            if (logfile) {
+                fprintf(logfile, "[HELLO_ACK] version=%d flags=0x%02X window=%lu\n",
+                        version, flags, window);
+            }
+            consume_packet(length);
+            return 0;
+        } else {
+            if (logfile) {
+                fprintf(logfile, "[ERROR] Expected HELLO_ACK, got 0x%02X\n", type);
+            }
+            consume_packet(length);
+        }
+    }
+
+    fprintf(stderr, "Timeout waiting for HELLO_ACK\n");
+    return -1;
 }
 
 /* ============================================================================
- * Operation handlers
+ * Stream Management
  * ============================================================================ */
 
-static void handle_fs_readFile(const char *params, char *response, size_t resplen) {
-    char path[MAX_PATH];
-    FILE *fp;
-    long file_len_signed;
-    size_t file_len;
-    char *content;
-    char *encoded;
-    size_t enc_len;
-
-    json_get_string(params, "path", path, sizeof(path));
-
-    fp = fopen(path, "rb");
-    if (!fp) {
-        snprintf(response, resplen, "{\"error\":\"%s\",\"code\":\"ENOENT\"}", strerror(errno));
-        return;
-    }
-
-    fseek(fp, 0, SEEK_END);
-    file_len_signed = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-
-    /* Validate file_len to prevent overflow/underflow issues.
-     * Max 7MB so base64 (~9.3MB) + JSON wrapper fits in 10MB response buffer */
-    if (file_len_signed < 0 || file_len_signed > 7 * 1024 * 1024) {
-        fclose(fp);
-        snprintf(response, resplen, "{\"error\":\"File too large (max 7MB)\"}");
-        return;
-    }
-    file_len = (size_t)file_len_signed;
-
-    content = malloc(file_len + 1);
-    if (!content) {
-        fclose(fp);
-        snprintf(response, resplen, "{\"error\":\"Out of memory\"}");
-        return;
-    }
-
-    fread(content, 1, file_len, fp);
-    content[file_len] = '\0';
-    fclose(fp);
-
-    /* Base64 encode */
-    enc_len = ((file_len + 2) / 3) * 4 + 1;
-    encoded = malloc(enc_len);
-    if (!encoded) {
-        free(content);
-        snprintf(response, resplen, "{\"error\":\"Out of memory\"}");
-        return;
-    }
-
-    {
-        static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        size_t i, j = 0;
-        for (i = 0; i < file_len; i += 3) {
-            unsigned int n = ((unsigned char)content[i]) << 16;
-            if (i + 1 < file_len) n |= ((unsigned char)content[i+1]) << 8;
-            if (i + 2 < file_len) n |= ((unsigned char)content[i+2]);
-
-            encoded[j++] = b64[(n >> 18) & 63];
-            encoded[j++] = b64[(n >> 12) & 63];
-            encoded[j++] = (i + 1 < file_len) ? b64[(n >> 6) & 63] : '=';
-            encoded[j++] = (i + 2 < file_len) ? b64[n & 63] : '=';
+static struct stream *find_stream(id)
+unsigned long id;
+{
+    int i;
+    for (i = 0; i < MAX_STREAMS; i++) {
+        if (streams[i].state != STREAM_STATE_IDLE && streams[i].id == id) {
+            return &streams[i];
         }
-        encoded[j] = '\0';
     }
-
-    snprintf(response, resplen, "{\"result\":\"%s\"}", encoded);
-
-    free(content);
-    free(encoded);
+    return NULL;
 }
 
-static void handle_fs_writeFile(const char *params, char *response, size_t resplen) {
-    char path[MAX_PATH];
-    char *data;
-    char *decoded;
-    size_t data_len, dec_len;
-    int is_buffer;
-    FILE *fp;
-
-    json_get_string(params, "path", path, sizeof(path));
-    is_buffer = json_get_bool(params, "isBuffer");
-
-    data = malloc(BUFFER_SIZE);
-    if (!data) {
-        snprintf(response, resplen, "{\"error\":\"Out of memory\"}");
-        return;
+static struct stream *alloc_stream(id)
+unsigned long id;
+{
+    int i;
+    for (i = 0; i < MAX_STREAMS; i++) {
+        if (streams[i].state == STREAM_STATE_IDLE) {
+            memset(&streams[i], 0, sizeof(struct stream));
+            streams[i].id = id;
+            streams[i].state = STREAM_STATE_OPEN;
+            streams[i].child_pid = -1;
+            streams[i].child_fd = -1;
+            return &streams[i];
+        }
     }
-    json_get_string(params, "data", data, BUFFER_SIZE);
-
-    if (is_buffer) {
-        /* Base64 decode */
-        data_len = strlen(data);
-        dec_len = (data_len / 4) * 3;
-        decoded = malloc(dec_len + 1);
-        if (!decoded) {
-            free(data);
-            snprintf(response, resplen, "{\"error\":\"Out of memory\"}");
-            return;
-        }
-
-        {
-            static const int d[] = {
-                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
-                -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
-                -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1
-            };
-            size_t i, j = 0;
-            /* Process only complete 4-byte groups to avoid buffer over-read */
-            for (i = 0; i + 3 < data_len; i += 4) {
-                int a = d[(unsigned char)data[i]];
-                int b = d[(unsigned char)data[i+1]];
-                int c = d[(unsigned char)data[i+2]];
-                int e = d[(unsigned char)data[i+3]];
-                if (a < 0 || b < 0) break;
-                decoded[j++] = (a << 2) | (b >> 4);
-                if (c >= 0) decoded[j++] = ((b & 15) << 4) | (c >> 2);
-                if (e >= 0) decoded[j++] = ((c & 3) << 6) | e;
-            }
-            dec_len = j;
-        }
-
-        fp = fopen(path, "wb");
-        if (!fp) {
-            free(data);
-            free(decoded);
-            snprintf(response, resplen, "{\"error\":\"%s\",\"code\":\"ENOENT\"}", strerror(errno));
-            return;
-        }
-        fwrite(decoded, 1, dec_len, fp);
-        fclose(fp);
-        free(decoded);
-    } else {
-        fp = fopen(path, "w");
-        if (!fp) {
-            free(data);
-            snprintf(response, resplen, "{\"error\":\"%s\",\"code\":\"ENOENT\"}", strerror(errno));
-            return;
-        }
-        fputs(data, fp);
-        fclose(fp);
-    }
-
-    free(data);
-    snprintf(response, resplen, "{\"result\":true}");
+    return NULL;  /* No free slots */
 }
 
-static void handle_fs_stat(const char *params, char *response, size_t resplen) {
-    char path[MAX_PATH];
+static void free_stream(s)
+struct stream *s;
+{
+    if (s->file_fp) {
+        fclose(s->file_fp);
+        s->file_fp = NULL;
+    }
+    if (s->dir_ptr) {
+        closedir(s->dir_ptr);
+        s->dir_ptr = NULL;
+    }
+    if (s->child_fd >= 0) {
+        close(s->child_fd);
+        s->child_fd = -1;
+    }
+    if (s->child_pid > 0) {
+        kill(s->child_pid, SIGTERM);
+        waitpid(s->child_pid, NULL, WNOHANG);
+        s->child_pid = -1;
+    }
+    s->state = STREAM_STATE_IDLE;
+}
+
+/* ============================================================================
+ * Stream Error Helper
+ * ============================================================================ */
+
+static int send_stream_error(stream_id, code, message)
+unsigned long stream_id;
+int code;
+char *message;
+{
+    unsigned char buf[256];
+    int len;
+
+    put_u32(buf, stream_id);
+    buf[4] = code;
+    strncpy((char *)buf + 5, message, sizeof(buf) - 6);
+    buf[sizeof(buf) - 1] = '\0';
+    len = 5 + strlen((char *)buf + 5) + 1;
+
+    return send_packet(PKT_STREAM_ERROR, buf, len);
+}
+
+static int send_stream_end(stream_id, status)
+unsigned long stream_id;
+int status;
+{
+    unsigned char buf[5];
+
+    put_u32(buf, stream_id);
+    buf[4] = status;
+
+    return send_packet(PKT_STREAM_END, buf, 5);
+}
+
+/* ============================================================================
+ * File Operations
+ * ============================================================================ */
+
+static void handle_file_read(s, path)
+struct stream *s;
+char *path;
+{
+    unsigned char buf[CHUNK_SIZE + 4];
+    int n;
+
+    s->file_fp = fopen(path, "rb");
+    if (!s->file_fp) {
+        send_stream_error(s->id, ERR_NOT_FOUND, strerror(errno));
+        free_stream(s);
+        return;
+    }
+
+    /* Stream file contents in chunks with flow control */
+    put_u32(buf, s->id);
+    while ((n = fread(buf + 4, 1, CHUNK_SIZE, s->file_fp)) > 0) {
+        if (send_stream_data_fc(buf, 4 + n) < 0) {
+            free_stream(s);
+            return;
+        }
+    }
+
+    fclose(s->file_fp);
+    s->file_fp = NULL;
+    send_stream_end(s->id, STATUS_OK);
+    free_stream(s);
+}
+
+static void handle_file_write(s, path, mode)
+struct stream *s;
+char *path;
+int mode;
+{
+    if (mode == 0) mode = 0644;
+
+    s->file_fp = fopen(path, "wb");
+    if (!s->file_fp) {
+        send_stream_error(s->id, ERR_NOT_FOUND, strerror(errno));
+        free_stream(s);
+        return;
+    }
+
+    /* Set permissions */
+    chmod(path, mode);
+
+    /* Stream is now open, data will come via STREAM_DATA packets */
+    /* Don't free_stream - wait for STREAM_END from relay */
+}
+
+static void handle_file_write_data(s, data, len)
+struct stream *s;
+unsigned char *data;
+int len;
+{
+    if (!s->file_fp) {
+        send_stream_error(s->id, ERR_INVALID, "No file open");
+        return;
+    }
+
+    if (fwrite(data, 1, len, s->file_fp) != len) {
+        send_stream_error(s->id, ERR_IO_ERROR, strerror(errno));
+        fclose(s->file_fp);
+        s->file_fp = NULL;
+        free_stream(s);
+    }
+}
+
+static void handle_file_write_end(s)
+struct stream *s;
+{
+    if (s->file_fp) {
+        fclose(s->file_fp);
+        s->file_fp = NULL;
+    }
+    send_stream_end(s->id, STATUS_OK);
+    free_stream(s);
+}
+
+static void handle_file_stat(s, path)
+struct stream *s;
+char *path;
+{
+    unsigned char buf[32];
     struct stat st;
+    unsigned char type;
 
-    json_get_string(params, "path", path, sizeof(path));
+    put_u32(buf, s->id);
 
     if (stat(path, &st) < 0) {
-        snprintf(response, resplen, "{\"error\":\"%s\",\"code\":\"ENOENT\"}", strerror(errno));
-        return;
-    }
-
-    snprintf(response, resplen,
-        "{\"result\":{"
-        "\"dev\":%lu,\"ino\":%lu,\"mode\":%u,\"nlink\":%lu,"
-        "\"uid\":%u,\"gid\":%u,\"rdev\":%lu,\"size\":%lu,"
-        "\"blksize\":%lu,\"blocks\":%lu,"
-        "\"atimeMs\":%lu,\"mtimeMs\":%lu,\"ctimeMs\":%lu,\"birthtimeMs\":%lu,"
-        "\"isFile\":%s,\"isDirectory\":%s,\"isSymbolicLink\":false"
-        "}}",
-        (unsigned long)st.st_dev, (unsigned long)st.st_ino, (unsigned)st.st_mode,
-        (unsigned long)st.st_nlink, (unsigned)st.st_uid, (unsigned)st.st_gid,
-        (unsigned long)st.st_rdev, (unsigned long)st.st_size,
-        (unsigned long)st.st_blksize, (unsigned long)st.st_blocks,
-        (unsigned long)st.st_atime * 1000, (unsigned long)st.st_mtime * 1000,
-        (unsigned long)st.st_ctime * 1000, (unsigned long)st.st_ctime * 1000,
-        S_ISREG(st.st_mode) ? "true" : "false",
-        S_ISDIR(st.st_mode) ? "true" : "false"
-    );
-}
-
-static void handle_fs_lstat(const char *params, char *response, size_t resplen) {
-    char path[MAX_PATH];
-    struct stat st;
-
-    json_get_string(params, "path", path, sizeof(path));
-
-    if (lstat(path, &st) < 0) {
-        snprintf(response, resplen, "{\"error\":\"%s\",\"code\":\"ENOENT\"}", strerror(errno));
-        return;
-    }
-
-    snprintf(response, resplen,
-        "{\"result\":{"
-        "\"dev\":%lu,\"ino\":%lu,\"mode\":%u,\"nlink\":%lu,"
-        "\"uid\":%u,\"gid\":%u,\"rdev\":%lu,\"size\":%lu,"
-        "\"blksize\":%lu,\"blocks\":%lu,"
-        "\"atimeMs\":%lu,\"mtimeMs\":%lu,\"ctimeMs\":%lu,\"birthtimeMs\":%lu,"
-        "\"isFile\":%s,\"isDirectory\":%s,\"isSymbolicLink\":%s"
-        "}}",
-        (unsigned long)st.st_dev, (unsigned long)st.st_ino, (unsigned)st.st_mode,
-        (unsigned long)st.st_nlink, (unsigned)st.st_uid, (unsigned)st.st_gid,
-        (unsigned long)st.st_rdev, (unsigned long)st.st_size,
-        (unsigned long)st.st_blksize, (unsigned long)st.st_blocks,
-        (unsigned long)st.st_atime * 1000, (unsigned long)st.st_mtime * 1000,
-        (unsigned long)st.st_ctime * 1000, (unsigned long)st.st_ctime * 1000,
-        S_ISREG(st.st_mode) ? "true" : "false",
-        S_ISDIR(st.st_mode) ? "true" : "false",
-        S_ISLNK(st.st_mode) ? "true" : "false"
-    );
-}
-
-static void handle_fs_readdir(const char *params, char *response, size_t resplen) {
-    char path[MAX_PATH];
-    DIR *dir;
-    struct dirent *ent;
-    size_t pos;
-    int first = 1;
-
-    json_get_string(params, "path", path, sizeof(path));
-
-    dir = opendir(path);
-    if (!dir) {
-        snprintf(response, resplen, "{\"error\":\"%s\",\"code\":\"ENOENT\"}", strerror(errno));
-        return;
-    }
-
-    pos = snprintf(response, resplen, "{\"result\":[");
-
-    while ((ent = readdir(dir)) != NULL) {
-        char escaped_name[1024];
-        char full_path[MAX_PATH + 256];  /* path + "/" + d_name (up to 255) */
-        struct stat st;
-
-        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
-            continue;
-
-        json_escape_string(ent->d_name, escaped_name, sizeof(escaped_name));
-
-        snprintf(full_path, sizeof(full_path), "%s/%s", path, ent->d_name);
-
-        if (pos + 256 >= resplen) break;
-
-        if (!first) response[pos++] = ',';
-        first = 0;
-
-        if (stat(full_path, &st) == 0) {
-            pos += snprintf(response + pos, resplen - pos,
-                "{\"name\":%s,\"isFile\":%s,\"isDirectory\":%s}",
-                escaped_name,
-                S_ISREG(st.st_mode) ? "true" : "false",
-                S_ISDIR(st.st_mode) ? "true" : "false"
-            );
-        } else {
-            pos += snprintf(response + pos, resplen - pos, "%s", escaped_name);
-        }
-    }
-
-    closedir(dir);
-    snprintf(response + pos, resplen - pos, "]}");
-}
-
-static void handle_fs_exists(const char *params, char *response, size_t resplen) {
-    char path[MAX_PATH];
-    struct stat st;
-
-    json_get_string(params, "path", path, sizeof(path));
-
-    if (stat(path, &st) == 0) {
-        snprintf(response, resplen, "{\"result\":true}");
+        buf[4] = 0;  /* exists = false */
+        buf[5] = '?';
+        put_u32(buf + 6, 0);  /* mode */
+        put_u32(buf + 10, 0); put_u32(buf + 14, 0);  /* size (64-bit) */
+        put_u32(buf + 18, 0); put_u32(buf + 22, 0);  /* mtime (64-bit) */
     } else {
-        snprintf(response, resplen, "{\"result\":false}");
+        if (S_ISREG(st.st_mode)) type = 'f';
+        else if (S_ISDIR(st.st_mode)) type = 'd';
+        else if (S_ISLNK(st.st_mode)) type = 'l';
+        else type = '?';
+
+        buf[4] = 1;  /* exists = true */
+        buf[5] = type;
+        put_u32(buf + 6, (unsigned long)st.st_mode);
+        /* size as 64-bit */
+        put_u32(buf + 10, 0);
+        put_u32(buf + 14, (unsigned long)st.st_size);
+        /* mtime as 64-bit */
+        put_u32(buf + 18, 0);
+        put_u32(buf + 22, (unsigned long)st.st_mtime);
     }
+
+    if (send_stream_data_fc(buf, 26) < 0) {
+        free_stream(s);
+        return;
+    }
+    send_stream_end(s->id, STATUS_OK);
+    free_stream(s);
 }
 
-static void handle_fs_mkdir(const char *params, char *response, size_t resplen) {
-    char path[MAX_PATH];
+static void handle_file_exists(s, path)
+struct stream *s;
+char *path;
+{
+    unsigned char buf[6];
+    struct stat st;
 
-    json_get_string(params, "path", path, sizeof(path));
+    put_u32(buf, s->id);
+    buf[4] = (stat(path, &st) == 0) ? 1 : 0;
 
+    if (send_stream_data_fc(buf, 5) < 0) {
+        free_stream(s);
+        return;
+    }
+    send_stream_end(s->id, STATUS_OK);
+    free_stream(s);
+}
+
+static void handle_mkdir(s, path)
+struct stream *s;
+char *path;
+{
     if (mkdir(path, 0755) < 0 && errno != EEXIST) {
-        snprintf(response, resplen, "{\"error\":\"%s\"}", strerror(errno));
-        return;
+        send_stream_error(s->id, ERR_IO_ERROR, strerror(errno));
+    } else {
+        send_stream_end(s->id, STATUS_OK);
     }
-
-    snprintf(response, resplen, "{\"result\":true}");
+    free_stream(s);
 }
 
-static void handle_fs_unlink(const char *params, char *response, size_t resplen) {
-    char path[MAX_PATH];
-
-    json_get_string(params, "path", path, sizeof(path));
-
+static void handle_remove(s, path)
+struct stream *s;
+char *path;
+{
     if (unlink(path) < 0) {
-        snprintf(response, resplen, "{\"error\":\"%s\"}", strerror(errno));
-        return;
+        send_stream_error(s->id, ERR_IO_ERROR, strerror(errno));
+    } else {
+        send_stream_end(s->id, STATUS_OK);
     }
-
-    snprintf(response, resplen, "{\"result\":true}");
+    free_stream(s);
 }
 
-static void handle_fs_rename(const char *params, char *response, size_t resplen) {
-    char old_path[MAX_PATH], new_path[MAX_PATH];
-
-    json_get_string(params, "oldPath", old_path, sizeof(old_path));
-    json_get_string(params, "newPath", new_path, sizeof(new_path));
-
-    if (rename(old_path, new_path) < 0) {
-        snprintf(response, resplen, "{\"error\":\"%s\"}", strerror(errno));
-        return;
+static void handle_move(s, oldpath, newpath)
+struct stream *s;
+char *oldpath;
+char *newpath;
+{
+    if (rename(oldpath, newpath) < 0) {
+        send_stream_error(s->id, ERR_IO_ERROR, strerror(errno));
+    } else {
+        send_stream_end(s->id, STATUS_OK);
     }
-
-    snprintf(response, resplen, "{\"result\":true}");
+    free_stream(s);
 }
 
-static void handle_fs_access(const char *params, char *response, size_t resplen) {
-    char path[MAX_PATH];
-    int mode;
-
-    json_get_string(params, "path", path, sizeof(path));
-    mode = (int)json_get_int(params, "mode");
-    if (mode < 0) mode = F_OK;
-
-    if (access(path, mode) < 0) {
-        snprintf(response, resplen, "{\"error\":\"%s\",\"code\":\"ENOENT\"}", strerror(errno));
-        return;
-    }
-
-    snprintf(response, resplen, "{\"result\":true}");
-}
-
-static void handle_fs_realpath(const char *params, char *response, size_t resplen) {
-    char path[MAX_PATH];
+static void handle_realpath(s, path)
+struct stream *s;
+char *path;
+{
+    unsigned char buf[MAX_PATH + 4];
     char resolved[MAX_PATH];
-    char escaped[MAX_PATH * 2];
 
-    json_get_string(params, "path", path, sizeof(path));
+    put_u32(buf, s->id);
 
-    if (!realpath(path, resolved)) {
-        snprintf(response, resplen, "{\"error\":\"%s\"}", strerror(errno));
+    if (realpath(path, resolved) == NULL) {
+        send_stream_error(s->id, ERR_NOT_FOUND, strerror(errno));
+        free_stream(s);
         return;
     }
-
-    json_escape_string(resolved, escaped, sizeof(escaped));
-    snprintf(response, resplen, "{\"result\":%s}", escaped);
+    strcpy((char *)buf + 4, resolved);
+    if (send_stream_data_fc(buf, 4 + strlen(resolved) + 1) < 0) {
+        free_stream(s);
+        return;
+    }
+    send_stream_end(s->id, STATUS_OK);
+    free_stream(s);
 }
 
 /* ============================================================================
- * Native find and search implementations
+ * Glob Pattern Matching
+ *
+ * Iterative algorithm with single backtrack point for '*'.
+ * Supports: * (any chars), ? (single char), [abc], [a-z], [!abc]
+ * O(n*m) worst case, O(n+m) typical. Zero allocations.
  * ============================================================================ */
 
-/* Simple wildcard pattern matcher (supports * and ?) */
-static int match_pattern(const char *pattern, const char *str) {
-    while (*pattern && *str) {
-        if (*pattern == '*') {
-            pattern++;
-            if (!*pattern) return 1;  /* trailing * matches all */
-            while (*str) {
-                if (match_pattern(pattern, str)) return 1;
-                str++;
-            }
-            return 0;
-        } else if (*pattern == '?' || *pattern == *str) {
-            pattern++;
-            str++;
-        } else {
-            return 0;
-        }
-    }
-    /* Handle trailing * */
-    while (*pattern == '*') pattern++;
-    return (*pattern == '\0' && *str == '\0');
-}
+static int glob_match(p, s)
+char *p, *s;
+{
+    char *star_p, *star_s, *q;
+    int match, invert;
 
-/* Recursive find helper - appends matches to result buffer */
-static void find_recursive(const char *dir_path, const char *pattern,
-                          char *result, size_t *pos, size_t maxlen, int *count, int max_results,
-                          int depth) {
-    DIR *dir;
-    struct dirent *ent;
-    char full_path[MAX_PATH + 256];  /* path + "/" + d_name */
-    struct stat st;
-    char escaped[MAX_PATH * 2 + 512];
+    star_p = NULL;
+    star_s = NULL;
 
-    /* Limit recursion depth to prevent stack overflow */
-    if (depth > 64) return;
-    if (*count >= max_results) return;
-
-    dir = opendir(dir_path);
-    if (!dir) return;
-
-    while ((ent = readdir(dir)) != NULL && *count < max_results) {
-        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+    while (*s) {
+        if (*p == '*') {
+            /* Star: save backtrack position, skip consecutive stars */
+            while (*p == '*') p++;
+            if (!*p) return 1;  /* Trailing * matches everything */
+            star_p = p;
+            star_s = s;
             continue;
+        }
 
-        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, ent->d_name);
+        if (*p == '?') {
+            /* Question mark: match any single character */
+            p++;
+            s++;
+            continue;
+        }
 
-        /* Use lstat to NOT follow symlinks - prevents infinite loops */
-        if (lstat(full_path, &st) < 0) continue;
+        if (*p == '[') {
+            /* Character class: [abc], [a-z], [!abc] */
+            match = 0;
+            invert = 0;
+            q = p + 1;
 
-        /* Skip symlinks entirely to avoid loops */
-        if (S_ISLNK(st.st_mode)) continue;
+            if (*q == '!' || *q == '^') {
+                invert = 1;
+                q++;
+            }
 
-        if (S_ISDIR(st.st_mode)) {
-            /* Recurse into subdirectory */
-            find_recursive(full_path, pattern, result, pos, maxlen, count, max_results, depth + 1);
-        } else if (S_ISREG(st.st_mode)) {
-            /* Check if filename matches pattern */
-            if (match_pattern(pattern, ent->d_name)) {
-                json_escape_string(full_path, escaped, sizeof(escaped));
-                if (*pos + strlen(escaped) + 2 < maxlen) {
-                    if (*count > 0) result[(*pos)++] = ',';
-                    *pos += snprintf(result + *pos, maxlen - *pos, "%s", escaped);
-                    (*count)++;
+            while (*q && *q != ']') {
+                if (q[1] == '-' && q[2] && q[2] != ']') {
+                    /* Range: a-z */
+                    if ((unsigned char)*s >= (unsigned char)q[0] &&
+                        (unsigned char)*s <= (unsigned char)q[2])
+                        match = 1;
+                    q += 3;
+                } else {
+                    /* Single character */
+                    if (*s == *q) match = 1;
+                    q++;
                 }
             }
-        }
-    }
 
-    closedir(dir);
-}
+            if (*q == ']') q++;
 
-static void handle_fs_find(const char *params, char *response, size_t resplen) {
-    char path[MAX_PATH];
-    char pattern[256];
-    size_t pos;
-    int count = 0;
+            if (invert) match = !match;
 
-    json_get_string(params, "path", path, sizeof(path));
-    json_get_string(params, "pattern", pattern, sizeof(pattern));
-
-    if (!path[0]) strcpy(path, ".");
-    if (!pattern[0]) strcpy(pattern, "*");
-
-    pos = snprintf(response, resplen, "{\"result\":[");
-    find_recursive(path, pattern, response, &pos, resplen - 10, &count, 200, 0);
-    snprintf(response + pos, resplen - pos, "]}");
-}
-
-/* Recursive search helper - searches file contents */
-/* Static buffers for search to avoid stack bloat during recursion.
- * search_match_buf must hold: path (4352) + ":" + linenum + ":" + line (2048) ≈ 6500
- * search_escaped_buf could double in worst case */
-static char search_line_buf[2048];
-static char search_match_buf[8192];
-static char search_escaped_buf[16384];
-
-/* Check if directory should be skipped */
-static int skip_directory(const char *name) {
-    /* Skip hidden directories (., .., .git, .svn, etc.) */
-    if (name[0] == '.') return 1;
-    /* Skip known large/slow directories */
-    if (strcmp(name, "node_modules") == 0) return 1;
-    if (strcmp(name, "__pycache__") == 0) return 1;
-    if (strcmp(name, "CVS") == 0) return 1;
-    if (strcmp(name, "RCS") == 0) return 1;
-    return 0;
-}
-
-/* Check if file extension suggests binary */
-static int is_binary_extension(const char *name) {
-    const char *ext = strrchr(name, '.');
-    if (!ext) return 0;
-    if (strcmp(ext, ".o") == 0 || strcmp(ext, ".a") == 0 ||
-        strcmp(ext, ".so") == 0 || strcmp(ext, ".dylib") == 0 ||
-        strcmp(ext, ".gz") == 0 || strcmp(ext, ".tar") == 0 ||
-        strcmp(ext, ".zip") == 0 || strcmp(ext, ".Z") == 0 ||
-        strcmp(ext, ".jpg") == 0 || strcmp(ext, ".jpeg") == 0 ||
-        strcmp(ext, ".png") == 0 || strcmp(ext, ".gif") == 0 ||
-        strcmp(ext, ".tiff") == 0 || strcmp(ext, ".tif") == 0 ||
-        strcmp(ext, ".pdf") == 0 || strcmp(ext, ".ps") == 0 ||
-        strcmp(ext, ".exe") == 0 || strcmp(ext, ".bin") == 0 ||
-        strcmp(ext, ".obj") == 0 || strcmp(ext, ".class") == 0 ||
-        strcmp(ext, ".pyc") == 0 || strcmp(ext, ".pyo") == 0) {
-        return 1;
-    }
-    return 0;
-}
-
-static void search_recursive(const char *dir_path, const char *search_pattern, const char *file_pattern,
-                            char *result, size_t *pos, size_t maxlen,
-                            int *match_count, int max_matches,
-                            int *file_count, int max_files,
-                            int depth) {
-    DIR *dir;
-    struct dirent *ent;
-    char full_path[MAX_PATH + 256];  /* path + "/" + d_name */
-    struct stat st;
-
-    /* Limit recursion depth - use smaller limit to save stack */
-    if (depth > 32) return;
-    if (*match_count >= max_matches) return;
-    if (*file_count >= max_files) return;
-
-    dir = opendir(dir_path);
-    if (!dir) return;
-
-    while ((ent = readdir(dir)) != NULL) {
-        /* Check limits */
-        if (*match_count >= max_matches) break;
-        if (*file_count >= max_files) break;
-
-        /* Skip . and .. */
-        if (ent->d_name[0] == '.' &&
-            (ent->d_name[1] == '\0' ||
-             (ent->d_name[1] == '.' && ent->d_name[2] == '\0')))
-            continue;
-
-        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, ent->d_name);
-
-        /* Use lstat to NOT follow symlinks */
-        if (lstat(full_path, &st) < 0) continue;
-
-        /* Skip symlinks */
-        if (S_ISLNK(st.st_mode)) continue;
-
-        if (S_ISDIR(st.st_mode)) {
-            /* Skip problematic directories */
-            if (skip_directory(ent->d_name)) continue;
-            /* Recurse */
-            search_recursive(full_path, search_pattern, file_pattern, result, pos, maxlen,
-                           match_count, max_matches, file_count, max_files, depth + 1);
-        } else if (S_ISREG(st.st_mode)) {
-            FILE *fp;
-            int line_num;
-            int is_binary;
-            size_t i, n;
-            char *newline;
-
-            /* Check file pattern */
-            if (file_pattern[0] && !match_pattern(file_pattern, ent->d_name)) continue;
-
-            /* Skip by extension */
-            if (is_binary_extension(ent->d_name)) continue;
-
-            /* Skip large files (>512KB) */
-            if (st.st_size > 512 * 1024) continue;
-
-            /* Skip empty files */
-            if (st.st_size == 0) continue;
-
-            /* Count this file */
-            (*file_count)++;
-
-            /* Open and check for binary content */
-            fp = fopen(full_path, "r");
-            if (!fp) continue;
-
-            /* Read first chunk and check for nulls */
-            n = fread(search_line_buf, 1, 512, fp);
-            is_binary = 0;
-            for (i = 0; i < n; i++) {
-                if (search_line_buf[i] == '\0') {
-                    is_binary = 1;
-                    break;
-                }
-            }
-            if (is_binary) {
-                fclose(fp);
+            if (match) {
+                p = q;
+                s++;
                 continue;
             }
-
-            /* Search the first chunk we already read */
-            search_line_buf[n] = '\0';
-            line_num = 1;
-
-            /* Process already-read data line by line */
-            {
-                char *line_start = search_line_buf;
-                char *line_end;
-                while ((line_end = strchr(line_start, '\n')) != NULL && *match_count < max_matches) {
-                    *line_end = '\0';
-                    /* Remove CR if present */
-                    if (line_end > line_start && *(line_end-1) == '\r')
-                        *(line_end-1) = '\0';
-
-                    if (strstr(line_start, search_pattern)) {
-                        snprintf(search_match_buf, sizeof(search_match_buf), "%s:%d:%s",
-                                full_path, line_num, line_start);
-                        json_escape_string(search_match_buf, search_escaped_buf, sizeof(search_escaped_buf));
-                        if (*pos + strlen(search_escaped_buf) + 2 < maxlen) {
-                            if (*match_count > 0) result[(*pos)++] = ',';
-                            *pos += snprintf(result + *pos, maxlen - *pos, "%s", search_escaped_buf);
-                            (*match_count)++;
-                        }
-                    }
-                    line_num++;
-                    line_start = line_end + 1;
-                }
-            }
-
-            /* Continue reading rest of file */
-            while (fgets(search_line_buf, sizeof(search_line_buf), fp) && *match_count < max_matches) {
-                line_num++;
-                if (line_num > 5000) break;  /* Limit lines per file */
-
-                /* Remove newlines */
-                newline = strchr(search_line_buf, '\n');
-                if (newline) *newline = '\0';
-                newline = strchr(search_line_buf, '\r');
-                if (newline) *newline = '\0';
-
-                if (strstr(search_line_buf, search_pattern)) {
-                    snprintf(search_match_buf, sizeof(search_match_buf), "%s:%d:%s",
-                            full_path, line_num, search_line_buf);
-                    json_escape_string(search_match_buf, search_escaped_buf, sizeof(search_escaped_buf));
-                    if (*pos + strlen(search_escaped_buf) + 2 < maxlen) {
-                        if (*match_count > 0) result[(*pos)++] = ',';
-                        *pos += snprintf(result + *pos, maxlen - *pos, "%s", search_escaped_buf);
-                        (*match_count)++;
-                    }
-                }
-            }
-
-            fclose(fp);
+            /* Fall through to backtrack */
+        } else if (*p == *s) {
+            /* Literal match */
+            p++;
+            s++;
+            continue;
         }
-    }
 
-    closedir(dir);
-}
-
-static void handle_fs_search(const char *params, char *response, size_t resplen) {
-    char path[MAX_PATH];
-    char pattern[512];
-    char file_pattern[256];
-    size_t pos;
-    int count = 0;
-
-    json_get_string(params, "path", path, sizeof(path));
-    json_get_string(params, "pattern", pattern, sizeof(pattern));
-    json_get_string(params, "filePattern", file_pattern, sizeof(file_pattern));
-
-    if (!path[0]) strcpy(path, ".");
-    if (!pattern[0]) {
-        snprintf(response, resplen, "{\"error\":\"pattern is required\"}");
-        return;
-    }
-
-    pos = snprintf(response, resplen, "{\"result\":[");
-    {
-        int file_count = 0;
-        search_recursive(path, pattern, file_pattern, response, &pos, resplen - 10, &count, 200, &file_count, 500, 0);
-    }
-    snprintf(response + pos, resplen - pos, "]}");
-}
-
-static void handle_cp_exec(const char *params, char *response, size_t resplen) {
-    char command[MAX_PATH * 2];
-    char wrapped_cmd[MAX_PATH * 2 + 32];
-    char *output;
-    char *escaped_output;
-    FILE *fp;
-    size_t output_len = 0;
-    int status;
-
-    if (logfile) { fprintf(logfile, "[cp.exec] parsing command from: %.100s\n", params); fflush(logfile); }
-
-    json_get_string(params, "command", command, sizeof(command));
-
-    if (logfile) { fprintf(logfile, "[cp.exec] command: %s\n", command); fflush(logfile); }
-
-    output = malloc(BUFFER_SIZE);
-    if (!output) {
-        snprintf(response, resplen, "{\"error\":\"Out of memory\"}");
-        return;
-    }
-
-    /* Wrap command to capture stderr (including shell errors like "command not found")
-     * The { cmd; } 2>&1 construct captures all stderr while preserving any
-     * redirections the command itself has (they apply inside the group) */
-    snprintf(wrapped_cmd, sizeof(wrapped_cmd), "{ %s; } 2>&1", command);
-
-    if (logfile) { fprintf(logfile, "[cp.exec] calling popen with: %s\n", wrapped_cmd); fflush(logfile); }
-
-    fp = popen(wrapped_cmd, "r");
-    if (!fp) {
-        if (logfile) { fprintf(logfile, "[cp.exec] popen failed: %s\n", strerror(errno)); fflush(logfile); }
-        free(output);
-        snprintf(response, resplen, "{\"error\":\"%s\",\"status\":-1,\"stdout\":\"\",\"stderr\":\"\"}", strerror(errno));
-        return;
-    }
-
-    if (logfile) { fprintf(logfile, "[cp.exec] popen succeeded, reading output...\n"); fflush(logfile); }
-
-    /* Cap output at 4MB so escaped (up to 8MB) + JSON wrapper fits in 10MB response */
-    {
-        size_t max_output = 4 * 1024 * 1024;
-        while (output_len < max_output) {
-            size_t n = fread(output + output_len, 1, max_output - output_len, fp);
-            if (n == 0) break;
-            output_len += n;
+        /* Mismatch: backtrack to last star */
+        if (star_p) {
+            p = star_p;
+            star_s++;
+            s = star_s;
+            continue;
         }
-        output[output_len] = '\0';
+
+        return 0;
     }
 
-    if (logfile) { fprintf(logfile, "[cp.exec] read %lu bytes, calling pclose...\n", (unsigned long)output_len); fflush(logfile); }
-
-    status = pclose(fp);
-
-    if (logfile) { fprintf(logfile, "[cp.exec] pclose returned %d\n", status); fflush(logfile); }
-
-    /* Extract exit status portably - NeXT uses union wait which doesn't work with int */
-#ifdef NEXT_COMPAT
-    if ((status & 0xff) == 0) {
-        status = (status >> 8) & 0xff;
-    }
-#else
-    if (WIFEXITED(status)) {
-        status = WEXITSTATUS(status);
-    }
-#endif
-
-    if (logfile) { fprintf(logfile, "[cp.exec] exit status: %d, output_len: %lu\n", status, (unsigned long)output_len); fflush(logfile); }
-
-    escaped_output = malloc(output_len * 2 + 3);
-    if (!escaped_output) {
-        free(output);
-        snprintf(response, resplen, "{\"error\":\"Out of memory\"}");
-        return;
-    }
-
-    json_escape_string(output, escaped_output, output_len * 2 + 3);
-
-    if (logfile) { fprintf(logfile, "[cp.exec] building response...\n"); fflush(logfile); }
-
-    snprintf(response, resplen, "{\"result\":{\"status\":%d,\"stdout\":%s,\"stderr\":\"\"}}",
-             status, escaped_output);
-
-    if (logfile) { fprintf(logfile, "[cp.exec] done, response: %.100s...\n", response); fflush(logfile); }
-
-    free(output);
-    free(escaped_output);
-}
-
-static void handle_request(const char *json, char *response, size_t resplen) {
-    char op[64];
-    char *params_buf;
-    char *params;
-    long req_id;
-    size_t params_len;
-
-    if (logfile) { fprintf(logfile, "[handle_request] parsing...\n"); fflush(logfile); }
-
-    req_id = json_get_int(json, "id");
-    json_get_string(json, "op", op, sizeof(op));
-
-    if (logfile) { fprintf(logfile, "[handle_request] id=%ld op=%s\n", req_id, op); fflush(logfile); }
-
-    /* Extract params object - find "params":{...} */
-    params = strstr(json, "\"params\":");
-    if (params) {
-        params += 9;
-        while (*params == ' ') params++;
-        params_len = strlen(params);
-        params_buf = malloc(params_len + 1);
-        if (!params_buf) {
-            snprintf(response, resplen, "{\"type\":\"response\",\"id\":%ld,\"error\":\"Out of memory\"}", req_id);
-            return;
-        }
-        strncpy(params_buf, params, params_len);
-        params_buf[params_len] = '\0';
-    } else {
-        params_buf = malloc(3);
-        if (!params_buf) {
-            snprintf(response, resplen, "{\"type\":\"response\",\"id\":%ld,\"error\":\"Out of memory\"}", req_id);
-            return;
-        }
-        strcpy(params_buf, "{}");
-    }
-
-    if (logfile) { fprintf(logfile, "[handle_request] params: %.100s\n", params_buf); fflush(logfile); }
-
-    /* Route to handler */
-    if (strcmp(op, "fs.readFile") == 0) {
-        handle_fs_readFile(params_buf, result_buffer, BUFFER_SIZE);
-    } else if (strcmp(op, "fs.writeFile") == 0) {
-        handle_fs_writeFile(params_buf, result_buffer, BUFFER_SIZE);
-    } else if (strcmp(op, "fs.stat") == 0) {
-        handle_fs_stat(params_buf, result_buffer, BUFFER_SIZE);
-    } else if (strcmp(op, "fs.lstat") == 0) {
-        handle_fs_lstat(params_buf, result_buffer, BUFFER_SIZE);
-    } else if (strcmp(op, "fs.readdir") == 0) {
-        handle_fs_readdir(params_buf, result_buffer, BUFFER_SIZE);
-    } else if (strcmp(op, "fs.exists") == 0) {
-        handle_fs_exists(params_buf, result_buffer, BUFFER_SIZE);
-    } else if (strcmp(op, "fs.mkdir") == 0) {
-        handle_fs_mkdir(params_buf, result_buffer, BUFFER_SIZE);
-    } else if (strcmp(op, "fs.unlink") == 0) {
-        handle_fs_unlink(params_buf, result_buffer, BUFFER_SIZE);
-    } else if (strcmp(op, "fs.rename") == 0) {
-        handle_fs_rename(params_buf, result_buffer, BUFFER_SIZE);
-    } else if (strcmp(op, "fs.access") == 0) {
-        handle_fs_access(params_buf, result_buffer, BUFFER_SIZE);
-    } else if (strcmp(op, "fs.realpath") == 0) {
-        handle_fs_realpath(params_buf, result_buffer, BUFFER_SIZE);
-    } else if (strcmp(op, "fs.find") == 0) {
-        handle_fs_find(params_buf, result_buffer, BUFFER_SIZE);
-    } else if (strcmp(op, "fs.search") == 0) {
-        handle_fs_search(params_buf, result_buffer, BUFFER_SIZE);
-    } else if (strcmp(op, "cp.exec") == 0 || strcmp(op, "cp.spawn") == 0) {
-        if (logfile) { fprintf(logfile, "[handle_request] calling handle_cp_exec\n"); fflush(logfile); }
-        handle_cp_exec(params_buf, result_buffer, BUFFER_SIZE);
-        if (logfile) { fprintf(logfile, "[handle_request] handle_cp_exec returned\n"); fflush(logfile); }
-    } else {
-        snprintf(result_buffer, BUFFER_SIZE, "{\"error\":\"Unknown operation: %s\"}", op);
-    }
-
-    /* Wrap response with ID and type */
-    snprintf(response, resplen, "{\"type\":\"response\",\"id\":%ld,%s",
-             req_id, result_buffer + 1);  /* Skip opening { of result_buffer */
-
-    free(params_buf);
+    /* String exhausted: pattern must be empty or all stars */
+    while (*p == '*') p++;
+    return *p == '\0';
 }
 
 /* ============================================================================
- * Main loop
+ * File Find (Glob-based recursive file search)
+ *
+ * Iterative directory walking with explicit stack.
+ * O(depth) memory, streams results as found.
  * ============================================================================ */
 
-static void main_loop(void) {
+#define MAX_DIR_DEPTH 64
+
+static void handle_file_find(s, base_path, pattern)
+struct stream *s;
+char *base_path;
+char *pattern;
+{
+    DIR *dir_stack[MAX_DIR_DEPTH];
+    int path_len[MAX_DIR_DEPTH];
+    int depth;
+    char path[MAX_PATH];
+    struct dirent *ent;
+    struct stat st;
+    unsigned char buf[MAX_PATH + 4];
+    int namelen;
+
+    /* Initialize path */
+    strncpy(path, base_path, MAX_PATH - 1);
+    path[MAX_PATH - 1] = '\0';
+
+    /* Check if base_path exists */
+    if (stat(path, &st) < 0) {
+        send_stream_error(s->id, ERR_NOT_FOUND, strerror(errno));
+        free_stream(s);
+        return;
+    }
+
+    /* If base is a file, just check it */
+    if (!S_ISDIR(st.st_mode)) {
+        char *name = strrchr(base_path, '/');
+        name = name ? name + 1 : base_path;
+        if (glob_match(pattern, name)) {
+            put_u32(buf, s->id);
+            strcpy((char *)buf + 4, base_path);
+            if (send_stream_data_fc(buf, 4 + strlen(base_path) + 1) < 0) {
+                free_stream(s);
+                return;
+            }
+        }
+        send_stream_end(s->id, STATUS_OK);
+        free_stream(s);
+        return;
+    }
+
+    /* Open base directory */
+    dir_stack[0] = opendir(path);
+    if (!dir_stack[0]) {
+        send_stream_error(s->id, ERR_NOT_FOUND, strerror(errno));
+        free_stream(s);
+        return;
+    }
+
+    path_len[0] = strlen(path);
+    depth = 0;
+    put_u32(buf, s->id);
+
+    while (depth >= 0) {
+        ent = readdir(dir_stack[depth]);
+
+        if (!ent) {
+            /* End of directory: pop stack */
+            closedir(dir_stack[depth]);
+            depth--;
+            if (depth >= 0) {
+                path[path_len[depth]] = '\0';
+            }
+            continue;
+        }
+
+        /* Skip . and .. */
+        if (ent->d_name[0] == '.') {
+            if (ent->d_name[1] == '\0') continue;
+            if (ent->d_name[1] == '.' && ent->d_name[2] == '\0') continue;
+        }
+
+        /* Build full path */
+        namelen = strlen(ent->d_name);
+        if (path_len[depth] + 1 + namelen >= MAX_PATH - 1) continue;
+        path[path_len[depth]] = '/';
+        strcpy(path + path_len[depth] + 1, ent->d_name);
+
+        /* Check if name matches pattern */
+        if (glob_match(pattern, ent->d_name)) {
+            strcpy((char *)buf + 4, path);
+            if (send_stream_data_fc(buf, 4 + strlen(path) + 1) < 0) {
+                /* Clean up directory stack on error */
+                while (depth >= 0) closedir(dir_stack[depth--]);
+                free_stream(s);
+                return;
+            }
+        }
+
+        /* Recurse into directories */
+        if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+            if (depth < MAX_DIR_DEPTH - 1) {
+                DIR *subdir = opendir(path);
+                if (subdir) {
+                    depth++;
+                    dir_stack[depth] = subdir;
+                    path_len[depth] = strlen(path);
+                }
+            }
+        }
+    }
+
+    send_stream_end(s->id, STATUS_OK);
+    free_stream(s);
+}
+
+/* ============================================================================
+ * Boyer-Moore-Horspool Substring Search
+ *
+ * O(n/m) average case (sublinear!), O(n*m) worst case.
+ * Simple skip table, fast inner loop.
+ * ============================================================================ */
+
+static void bm_build_skip(pattern, plen, skip)
+char *pattern;
+int plen;
+int skip[256];
+{
+    int i;
+
+    for (i = 0; i < 256; i++) {
+        skip[i] = plen;
+    }
+
+    for (i = 0; i < plen - 1; i++) {
+        skip[(unsigned char)pattern[i]] = plen - 1 - i;
+    }
+}
+
+static char *bm_search(text, tlen, pattern, plen, skip)
+char *text;
+int tlen;
+char *pattern;
+int plen;
+int skip[256];
+{
+    int i, j;
+
+    if (plen == 0) return text;
+    if (plen > tlen) return NULL;
+
+    i = 0;
+    while (i <= tlen - plen) {
+        j = plen - 1;
+        while (j >= 0 && text[i + j] == pattern[j]) {
+            j--;
+        }
+        if (j < 0) {
+            return text + i;
+        }
+        i += skip[(unsigned char)text[i + plen - 1]];
+    }
+
+    return NULL;
+}
+
+/* ============================================================================
+ * Binary File Detection
+ *
+ * Check for NUL bytes in first 512 bytes.
+ * Simple, effective, portable.
+ * ============================================================================ */
+
+static int is_binary_file(path)
+char *path;
+{
+    int fd, n, i;
+    unsigned char buf[512];
+
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+
+    n = read(fd, buf, sizeof(buf));
+    close(fd);
+
+    if (n <= 0) return 0;
+
+    for (i = 0; i < n; i++) {
+        if (buf[i] == '\0') return 1;
+    }
+
+    return 0;
+}
+
+/* ============================================================================
+ * File Search (Grep-like content search)
+ *
+ * Boyer-Moore-Horspool for fast substring matching.
+ * Iterative directory walking, binary file skipping.
+ * Streams results as found.
+ * ============================================================================ */
+
+#define MAX_LINE_LEN 4096
+
+static int search_in_file(s, filepath, pattern, plen, skip)
+struct stream *s;
+char *filepath;
+char *pattern;
+int plen;
+int skip[256];
+{
+    FILE *fp;
+    char line[MAX_LINE_LEN];
+    unsigned char buf[8 + MAX_PATH + MAX_LINE_LEN];
+    unsigned long line_num;
+    int pathlen, linelen;
+    char *nl;
+
+    fp = fopen(filepath, "r");
+    if (!fp) return 0;  /* Skip unreadable files */
+
+    put_u32(buf, s->id);
+    pathlen = strlen(filepath);
+
+    line_num = 0;
+
+    while (fgets(line, sizeof(line), fp)) {
+        line_num++;
+
+        /* Strip newline */
+        nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        linelen = strlen(line);
+
+        /* Search for pattern */
+        if (bm_search(line, linelen, pattern, plen, skip)) {
+            /* Match format: stream_id(4) + line_num(4) + path(str) + line(str) */
+            put_u32(buf + 4, line_num);
+            strcpy((char *)buf + 8, filepath);
+            strcpy((char *)buf + 8 + pathlen + 1, line);
+            if (send_stream_data_fc(buf, 8 + pathlen + 1 + linelen + 1) < 0) {
+                fclose(fp);
+                return -1;  /* Flow control error */
+            }
+        }
+    }
+
+    fclose(fp);
+    return 0;
+}
+
+static void handle_file_search(s, base_path, pattern)
+struct stream *s;
+char *base_path;
+char *pattern;
+{
+    DIR *dir_stack[MAX_DIR_DEPTH];
+    int path_len[MAX_DIR_DEPTH];
+    int depth;
+    char path[MAX_PATH];
+    struct dirent *ent;
+    struct stat st;
+    int skip[256];
+    int plen;
+    int namelen;
+
+    plen = strlen(pattern);
+    if (plen == 0) {
+        send_stream_end(s->id, STATUS_OK);
+        free_stream(s);
+        return;
+    }
+
+    /* Build skip table once for all files */
+    bm_build_skip(pattern, plen, skip);
+
+    /* Check if base_path exists */
+    if (stat(base_path, &st) < 0) {
+        send_stream_error(s->id, ERR_NOT_FOUND, strerror(errno));
+        free_stream(s);
+        return;
+    }
+
+    /* If base is a file, just search it */
+    if (S_ISREG(st.st_mode)) {
+        if (!is_binary_file(base_path)) {
+            if (search_in_file(s, base_path, pattern, plen, skip) < 0) {
+                free_stream(s);
+                return;
+            }
+        }
+        send_stream_end(s->id, STATUS_OK);
+        free_stream(s);
+        return;
+    }
+
+    /* Initialize path for directory walking */
+    strncpy(path, base_path, MAX_PATH - 1);
+    path[MAX_PATH - 1] = '\0';
+
+    dir_stack[0] = opendir(path);
+    if (!dir_stack[0]) {
+        send_stream_error(s->id, ERR_NOT_FOUND, strerror(errno));
+        free_stream(s);
+        return;
+    }
+
+    path_len[0] = strlen(path);
+    depth = 0;
+
+    while (depth >= 0) {
+        ent = readdir(dir_stack[depth]);
+
+        if (!ent) {
+            /* End of directory: pop stack */
+            closedir(dir_stack[depth]);
+            depth--;
+            if (depth >= 0) {
+                path[path_len[depth]] = '\0';
+            }
+            continue;
+        }
+
+        /* Skip . and .. */
+        if (ent->d_name[0] == '.') {
+            if (ent->d_name[1] == '\0') continue;
+            if (ent->d_name[1] == '.' && ent->d_name[2] == '\0') continue;
+        }
+
+        /* Build full path */
+        namelen = strlen(ent->d_name);
+        if (path_len[depth] + 1 + namelen >= MAX_PATH - 1) continue;
+        path[path_len[depth]] = '/';
+        strcpy(path + path_len[depth] + 1, ent->d_name);
+
+        if (stat(path, &st) < 0) continue;
+
+        if (S_ISREG(st.st_mode)) {
+            /* Regular file: search if not binary */
+            if (!is_binary_file(path)) {
+                if (search_in_file(s, path, pattern, plen, skip) < 0) {
+                    /* Clean up directory stack on error */
+                    while (depth >= 0) closedir(dir_stack[depth--]);
+                    free_stream(s);
+                    return;
+                }
+            }
+        } else if (S_ISDIR(st.st_mode)) {
+            /* Directory: push onto stack */
+            if (depth < MAX_DIR_DEPTH - 1) {
+                DIR *subdir = opendir(path);
+                if (subdir) {
+                    depth++;
+                    dir_stack[depth] = subdir;
+                    path_len[depth] = strlen(path);
+                }
+            }
+        }
+    }
+
+    send_stream_end(s->id, STATUS_OK);
+    free_stream(s);
+}
+
+/* ============================================================================
+ * Directory Listing
+ * ============================================================================ */
+
+static void handle_dir_list(s, path)
+struct stream *s;
+char *path;
+{
+    unsigned char buf[512];
+    struct dirent *ent;
+    struct stat st;
+    char fullpath[MAX_PATH];
+    unsigned char type;
+    int namelen;
+
+    s->dir_ptr = opendir(path);
+    if (!s->dir_ptr) {
+        send_stream_error(s->id, ERR_NOT_FOUND, strerror(errno));
+        free_stream(s);
+        return;
+    }
+
+    put_u32(buf, s->id);
+
+    while ((ent = readdir(s->dir_ptr)) != NULL) {
+        int pathlen, dnamelen;
+
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+            continue;
+
+        /* Bounds check before sprintf to prevent overflow */
+        pathlen = strlen(path);
+        dnamelen = strlen(ent->d_name);
+        if (pathlen + 1 + dnamelen >= MAX_PATH) {
+            continue;  /* Skip entries that would overflow buffer */
+        }
+        sprintf(fullpath, "%s/%s", path, ent->d_name);
+        if (stat(fullpath, &st) < 0) {
+            type = '?';
+            st.st_size = 0;
+            st.st_mtime = 0;
+        } else if (S_ISREG(st.st_mode)) {
+            type = 'f';
+        } else if (S_ISDIR(st.st_mode)) {
+            type = 'd';
+        } else if (S_ISLNK(st.st_mode)) {
+            type = 'l';
+        } else {
+            type = '?';
+        }
+
+        /* Entry format: type(1) + size(8) + mtime(8) + name(null-term) */
+        buf[4] = type;
+        put_u32(buf + 5, 0);
+        put_u32(buf + 9, (unsigned long)st.st_size);
+        put_u32(buf + 13, 0);
+        put_u32(buf + 17, (unsigned long)st.st_mtime);
+        namelen = strlen(ent->d_name);
+        if (namelen > sizeof(buf) - 22) namelen = sizeof(buf) - 22;
+        memcpy(buf + 21, ent->d_name, namelen);
+        buf[21 + namelen] = '\0';
+
+        if (send_stream_data_fc(buf, 21 + namelen + 1) < 0) {
+            closedir(s->dir_ptr);
+            s->dir_ptr = NULL;
+            free_stream(s);
+            return;
+        }
+    }
+
+    closedir(s->dir_ptr);
+    s->dir_ptr = NULL;
+    send_stream_end(s->id, STATUS_OK);
+    free_stream(s);
+}
+
+/* ============================================================================
+ * Command Execution (Streaming)
+ * ============================================================================ */
+
+static void handle_exec(s, command)
+struct stream *s;
+char *command;
+{
+    int pipefd[2];
+    int pid;
+
+    if (pipe(pipefd) < 0) {
+        send_stream_error(s->id, ERR_IO_ERROR, strerror(errno));
+        free_stream(s);
+        return;
+    }
+
+    pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        send_stream_error(s->id, ERR_IO_ERROR, strerror(errno));
+        free_stream(s);
+        return;
+    }
+
+    if (pid == 0) {
+        /* Child process */
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+
+        execl("/bin/sh", "sh", "-c", command, (char *)NULL);
+        _exit(127);
+    }
+
+    /* Parent process */
+    close(pipefd[1]);
+    s->child_pid = pid;
+    s->child_fd = pipefd[0];
+
+    /* Set non-blocking */
+    fcntl(s->child_fd, F_SETFL, O_NONBLOCK);
+}
+
+/*
+ * Poll a running exec stream, send any available output.
+ * Returns 1 if stream still active, 0 if done, -1 on error.
+ */
+static int poll_exec_stream(s)
+struct stream *s;
+{
+    unsigned char buf[SMALL_CHUNK + 5];
+    int n, status;
+
+    if (s->child_fd < 0) return 0;
+
+    put_u32(buf, s->id);
+    buf[4] = CHAN_STDOUT;  /* We merged stdout/stderr */
+
+    n = read(s->child_fd, buf + 5, SMALL_CHUNK);
+    if (n > 0) {
+        if (send_stream_data_fc(buf, 5 + n) < 0) {
+            return -1;  /* Flow control error */
+        }
+        return 1;
+    }
+
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        /* No data available, check if child still running */
+        if (waitpid(s->child_pid, &status, WNOHANG) == 0) {
+            return 1;  /* Still running */
+        }
+        /* Child exited, drain any remaining output */
+        while ((n = read(s->child_fd, buf + 5, SMALL_CHUNK)) > 0) {
+            if (send_stream_data_fc(buf, 5 + n) < 0) {
+                return -1;  /* Flow control error */
+            }
+        }
+    } else {
+        /* n == 0 (EOF) or error, wait for child (non-blocking) */
+        if (waitpid(s->child_pid, &status, WNOHANG) == 0) {
+            /* Child still running, try again later */
+            return 1;
+        }
+    }
+
+    /* Send STREAM_END with exit status */
+    close(s->child_fd);
+    s->child_fd = -1;
+    s->child_pid = -1;
+
+    {
+        unsigned char endbuf[9];
+        put_u32(endbuf, s->id);
+        if (WIFEXITED(status)) {
+            endbuf[4] = EXIT_NORMAL;
+            put_u32(endbuf + 5, WEXITSTATUS(status));
+        } else if (WIFSIGNALED(status)) {
+            endbuf[4] = EXIT_SIGNAL;
+            put_u32(endbuf + 5, WTERMSIG(status));
+        } else {
+            endbuf[4] = EXIT_UNKNOWN;
+            put_u32(endbuf + 5, 0);
+        }
+        send_packet(PKT_STREAM_END, endbuf, 9);
+    }
+
+    free_stream(s);
+    return 0;
+}
+
+/* ============================================================================
+ * STREAM_OPEN Handler
+ * ============================================================================ */
+
+/*
+ * Safely extract a null-terminated string from a buffer.
+ * Returns pointer to string if null terminator found within bounds, NULL otherwise.
+ * If end_out is non-NULL, sets it to point past the null terminator.
+ */
+static char *safe_string(buf, offset, length, end_out)
+unsigned char *buf;
+int offset;
+int length;
+unsigned char **end_out;
+{
+    unsigned char *start, *p, *limit;
+
+    if (offset >= length) return NULL;
+
+    start = buf + offset;
+    limit = buf + length;
+
+    /* Look for null terminator within remaining buffer */
+    for (p = start; p < limit; p++) {
+        if (*p == '\0') {
+            if (end_out) *end_out = p + 1;
+            return (char *)start;
+        }
+    }
+
+    return NULL;  /* No null terminator found */
+}
+
+static void handle_stream_open(payload, length)
+unsigned char *payload;
+int length;
+{
+    unsigned long stream_id;
+    int stream_type;
+    struct stream *s;
+    char *path, *newpath;
+    unsigned char *path_end;
+    int mode;
+
+    if (length < 5) return;
+
+    stream_id = get_u32(payload);
+    stream_type = payload[4];
+
+    /* Check for duplicate stream ID */
+    if (find_stream(stream_id)) {
+        send_stream_error(stream_id, ERR_INVALID, "Stream ID already in use");
+        return;
+    }
+
+    /* Validate first string (path) is null-terminated within payload */
+    path = safe_string(payload, 5, length, &path_end);
+    if (!path) {
+        send_stream_error(stream_id, ERR_INVALID, "Invalid path (no null terminator)");
+        return;
+    }
+
+    /* Validate path length doesn't exceed MAX_PATH */
+    if (strlen(path) >= MAX_PATH) {
+        send_stream_error(stream_id, ERR_INVALID, "Path too long");
+        return;
+    }
+
+    s = alloc_stream(stream_id);
+    if (!s) {
+        send_stream_error(stream_id, ERR_NO_MEMORY, "Too many streams");
+        return;
+    }
+    s->type = stream_type;
+
+    switch (stream_type) {
+        case STREAM_FILE_READ:
+            handle_file_read(s, path);
+            break;
+
+        case STREAM_FILE_WRITE:
+            /* path(string) + mode(uint16) */
+            mode = 0;
+            if (path_end + 2 <= payload + length) {
+                mode = get_u16(path_end);
+            }
+            handle_file_write(s, path, mode);
+            break;
+
+        case STREAM_EXEC:
+            handle_exec(s, path);
+            break;
+
+        case STREAM_DIR_LIST:
+            handle_dir_list(s, path);
+            break;
+
+        case STREAM_FILE_STAT:
+            handle_file_stat(s, path);
+            break;
+
+        case STREAM_FILE_EXISTS:
+            handle_file_exists(s, path);
+            break;
+
+        case STREAM_MKDIR:
+            handle_mkdir(s, path);
+            break;
+
+        case STREAM_REMOVE:
+            handle_remove(s, path);
+            break;
+
+        case STREAM_MOVE:
+            /* path(string) + newpath(string) - validate second string */
+            newpath = safe_string(payload, path_end - payload, length, NULL);
+            if (!newpath) {
+                send_stream_error(stream_id, ERR_INVALID, "Invalid destination path");
+                free_stream(s);
+                return;
+            }
+            if (strlen(newpath) >= MAX_PATH) {
+                send_stream_error(stream_id, ERR_INVALID, "Destination path too long");
+                free_stream(s);
+                return;
+            }
+            handle_move(s, path, newpath);
+            break;
+
+        case STREAM_REALPATH:
+            handle_realpath(s, path);
+            break;
+
+        case STREAM_FILE_FIND:
+            /* path(string) + pattern(string) - validate second string */
+            newpath = safe_string(payload, path_end - payload, length, NULL);
+            if (!newpath) {
+                send_stream_error(stream_id, ERR_INVALID, "Invalid search pattern");
+                free_stream(s);
+                return;
+            }
+            handle_file_find(s, path, newpath);
+            break;
+
+        case STREAM_FILE_SEARCH:
+            /* path(string) + pattern(string) - validate second string */
+            newpath = safe_string(payload, path_end - payload, length, NULL);
+            if (!newpath) {
+                send_stream_error(stream_id, ERR_INVALID, "Invalid search pattern");
+                free_stream(s);
+                return;
+            }
+            handle_file_search(s, path, newpath);
+            break;
+
+        default:
+            send_stream_error(stream_id, ERR_INVALID, "Unknown stream type");
+            free_stream(s);
+            break;
+    }
+}
+
+/* ============================================================================
+ * Packet Handlers
+ * ============================================================================ */
+
+/*
+ * Send WINDOW_UPDATE to relay to acknowledge received bytes.
+ * Called periodically after receiving data to prevent relay from blocking.
+ */
+static void send_window_update()
+{
+    unsigned char buf[4];
+
+    if (bytes_to_ack >= WINDOW_UPDATE_THRESHOLD) {
+        put_u32(buf, bytes_to_ack);
+        send_packet(PKT_WINDOW_UPDATE, buf, 4);
+        if (logfile) {
+            fprintf(logfile, "[FLOW] Sent window update +%lu\n", bytes_to_ack);
+        }
+        bytes_to_ack = 0;
+    }
+}
+
+static void handle_stream_data(payload, length)
+unsigned char *payload;
+int length;
+{
+    unsigned long stream_id;
+    struct stream *s;
+
+    if (length < 4) return;
+
+    stream_id = get_u32(payload);
+    s = find_stream(stream_id);
+    if (!s) {
+        if (logfile) fprintf(logfile, "[WARN] Data for unknown stream %lu\n", stream_id);
+        return;
+    }
+
+    if (s->type == STREAM_FILE_WRITE) {
+        handle_file_write_data(s, payload + 4, length - 4);
+    }
+    /* Other stream types don't receive data from relay */
+
+    /* Acknowledge received data for flow control */
+    bytes_to_ack += length;
+    send_window_update();
+}
+
+static void handle_stream_end(payload, length)
+unsigned char *payload;
+int length;
+{
+    unsigned long stream_id;
+    struct stream *s;
+
+    if (length < 5) return;
+
+    stream_id = get_u32(payload);
+    s = find_stream(stream_id);
+    if (!s) return;
+
+    if (s->type == STREAM_FILE_WRITE) {
+        handle_file_write_end(s);
+    } else {
+        free_stream(s);
+    }
+}
+
+static void handle_stream_cancel(payload, length)
+unsigned char *payload;
+int length;
+{
+    unsigned long stream_id;
+    struct stream *s;
+
+    if (length < 4) return;
+
+    stream_id = get_u32(payload);
+    s = find_stream(stream_id);
+    if (!s) return;
+
+    send_stream_end(stream_id, STATUS_CANCELLED);
+    free_stream(s);
+}
+
+static void handle_window_update(payload, length)
+unsigned char *payload;
+int length;
+{
+    unsigned long increment;
+
+    if (length < 4) return;
+
+    increment = get_u32(payload);
+    if (bytes_in_flight >= increment) {
+        bytes_in_flight -= increment;
+    } else {
+        bytes_in_flight = 0;
+    }
+
+    if (logfile) {
+        fprintf(logfile, "[FLOW] Window update +%lu, in_flight=%lu\n",
+                increment, bytes_in_flight);
+    }
+}
+
+/* ============================================================================
+ * Main Loop
+ * ============================================================================ */
+
+static void main_loop()
+{
     fd_set readfds;
     struct timeval tv;
-    int maxfd, rows, cols, n, len;
+    int maxfd, n, i;
+    int rows, cols;
     char input_buf[256];
-    char escaped[512];
-    char type[32];
-    char *data;
-    char *filtered;
-    size_t datalen, flen, x;
+    unsigned char *payload;
+    int length, type;
+    unsigned char resize_buf[4];
 
     enable_raw_mode();
-
-    /* Set up SIGWINCH handler */
     signal(SIGWINCH, sigwinch_handler);
 
     /* Send initial terminal size */
     get_terminal_size(&rows, &cols);
-    snprintf(send_buffer, BUFFER_SIZE, "{\"type\":\"resize\",\"rows\":%d,\"cols\":%d}", rows, cols);
-    send_message(send_buffer);
+    put_u16(resize_buf, rows);
+    put_u16(resize_buf + 2, cols);
+    send_packet(PKT_TERM_RESIZE, resize_buf, 4);
 
-    maxfd = (sockfd > STDIN_FILENO) ? sockfd : STDIN_FILENO;
+    maxfd = sockfd;
 
     while (1) {
         /* Handle window resize */
         if (got_sigwinch) {
             got_sigwinch = 0;
             get_terminal_size(&rows, &cols);
-            snprintf(send_buffer, BUFFER_SIZE, "{\"type\":\"resize\",\"rows\":%d,\"cols\":%d}", rows, cols);
-            send_message(send_buffer);
+            put_u16(resize_buf, rows);
+            put_u16(resize_buf + 2, cols);
+            send_packet(PKT_TERM_RESIZE, resize_buf, 4);
         }
 
         FD_ZERO(&readfds);
         FD_SET(sockfd, &readfds);
         FD_SET(STDIN_FILENO, &readfds);
 
-        tv.tv_sec = 0;
-        tv.tv_usec = 100000;  /* 100ms */
+        /* Also watch exec streams */
+        for (i = 0; i < MAX_STREAMS; i++) {
+            if (streams[i].state != STREAM_STATE_IDLE &&
+                streams[i].type == STREAM_EXEC &&
+                streams[i].child_fd >= 0) {
+                FD_SET(streams[i].child_fd, &readfds);
+                if (streams[i].child_fd > maxfd)
+                    maxfd = streams[i].child_fd;
+            }
+        }
 
-        if (select(maxfd + 1, &readfds, NULL, NULL, &tv) < 0) {
+        tv.tv_sec = 0;
+        tv.tv_usec = 10000;  /* 10ms - short for responsiveness */
+
+        n = select(maxfd + 1, &readfds, NULL, NULL, &tv);
+        if (n < 0) {
             if (errno == EINTR) continue;
             break;
         }
 
         /* Handle terminal input */
         if (FD_ISSET(STDIN_FILENO, &readfds)) {
-            n = read(STDIN_FILENO, input_buf, sizeof(input_buf) - 1);
+            n = read(STDIN_FILENO, input_buf, sizeof(input_buf));
             if (n > 0) {
-                input_buf[n] = '\0';
-
-                /* Debug: log input bytes in hex */
-                if (logfile) {
-                    int ii;
-                    fprintf(logfile, "[INPUT] %d bytes: ", n);
-                    for (ii = 0; ii < n; ii++) {
-                        fprintf(logfile, "%02x ", (unsigned char)input_buf[ii]);
-                    }
-                    fprintf(logfile, " = \"");
-                    for (ii = 0; ii < n; ii++) {
-                        unsigned char c = (unsigned char)input_buf[ii];
-                        if (c >= 32 && c < 127) {
-                            fprintf(logfile, "%c", c);
-                        } else if (c == 27) {
-                            fprintf(logfile, "<ESC>");
-                        } else {
-                            fprintf(logfile, "<%02x>", c);
-                        }
-                    }
-                    fprintf(logfile, "\"\n");
-                    fflush(logfile);
-                }
-
-                json_escape_string(input_buf, escaped, sizeof(escaped));
-                snprintf(send_buffer, BUFFER_SIZE, "{\"type\":\"terminal_input\",\"data\":%s}", escaped);
-                send_message(send_buffer);
+                send_packet(PKT_TERM_INPUT, (unsigned char *)input_buf, n);
             }
         }
 
-        /* Handle messages from relay */
-        if (FD_ISSET(sockfd, &readfds)) {
-            len = recv_message(recv_buffer, BUFFER_SIZE);
-            if (len <= 0) {
-                fprintf(stderr, "\r\nConnection closed\r\n");
-                break;
+        /* Handle exec stream output - poll all active exec streams */
+        for (i = 0; i < MAX_STREAMS; i++) {
+            if (streams[i].state != STREAM_STATE_IDLE &&
+                streams[i].type == STREAM_EXEC &&
+                streams[i].child_fd >= 0) {
+                if (poll_exec_stream(&streams[i]) < 0) {
+                    fprintf(stderr, "\r\nFlow control error\r\n");
+                    goto done;
+                }
             }
+        }
 
-            json_get_string(recv_buffer, "type", type, sizeof(type));
+        /* Handle packets from relay - process ALL available packets */
+        if (FD_ISSET(sockfd, &readfds) || recv_buf_len > 0) {
+            /* Keep processing while we have complete packets */
+            while (1) {
+                type = recv_packet(&payload, &length);
+                if (type < 0) {
+                    fprintf(stderr, "\r\nConnection closed\r\n");
+                    goto done;
+                }
+                if (type == 0) break;  /* No complete packet, back to select */
 
-            if (strcmp(type, "terminal_output") == 0) {
-                data = malloc(len + 1);
-                if (data) {
-                    json_get_string(recv_buffer, "data", data, len + 1);
-                    datalen = strlen(data);
-
-                    if (logfile) {
-                        fprintf(logfile, "=== RECV len=%d datalen=%zu simple=%d ===\n",
-                                len, datalen, simple_mode);
-                        /* Log hex dump of first 200 bytes */
-                        fprintf(logfile, "HEX: ");
-                        for (x = 0; x < datalen && x < 200; x++) {
-                            fprintf(logfile, "%02x ", (unsigned char)data[x]);
+                switch (type) {
+                    case PKT_TERM_OUTPUT:
+                        if (simple_mode) {
+                            int filtered_len = filter_simple(payload, length);
+                            write(STDOUT_FILENO, payload, filtered_len);
+                        } else {
+                            write(STDOUT_FILENO, payload, length);
                         }
-                        fprintf(logfile, "\n");
-                        fflush(logfile);
-                    }
+                        /* Acknowledge received data for flow control */
+                        bytes_to_ack += length;
+                        send_window_update();
+                        break;
 
-                    if (simple_mode) {
-                        filtered = malloc(len + 1);
-                        if (filtered) {
-                            flen = filter_terminal_output(data, filtered, len + 1);
+                    case PKT_STREAM_OPEN:
+                        handle_stream_open(payload, length);
+                        break;
 
-                            if (logfile) {
-                                fprintf(logfile, "FILTERED len=%zu\n", flen);
-                                fprintf(logfile, "HEX: ");
-                                for (x = 0; x < flen && x < 200; x++) {
-                                    fprintf(logfile, "%02x ", (unsigned char)filtered[x]);
-                                }
-                                fprintf(logfile, "\n---\n");
-                                fflush(logfile);
-                            }
+                    case PKT_STREAM_DATA:
+                        handle_stream_data(payload, length);
+                        break;
 
-                            write(STDOUT_FILENO, filtered, flen);
-                            free(filtered);
+                    case PKT_STREAM_END:
+                        handle_stream_end(payload, length);
+                        break;
+
+                    case PKT_STREAM_CANCEL:
+                        handle_stream_cancel(payload, length);
+                        break;
+
+                    case PKT_WINDOW_UPDATE:
+                        handle_window_update(payload, length);
+                        break;
+
+                    case PKT_PING:
+                        send_packet(PKT_PONG, payload, length);
+                        break;
+
+                    case PKT_GOODBYE:
+                        if (logfile) {
+                            fprintf(logfile, "[GOODBYE] reason=%d\n",
+                                    length > 0 ? payload[0] : -1);
                         }
-                    } else {
-                        write(STDOUT_FILENO, data, datalen);
-                    }
-                    free(data);
+                        fprintf(stderr, "\r\nServer disconnected\r\n");
+                        consume_packet(length);
+                        goto done;
+
+                    default:
+                        if (logfile) {
+                            fprintf(logfile, "[WARN] Unknown packet type 0x%02X\n", type);
+                        }
+                        break;
                 }
-            } else if (strcmp(type, "request") == 0) {
-                if (logfile) {
-                    fprintf(logfile, "=== REQUEST received ===\n");
-                    fprintf(logfile, "RAW: %.200s...\n", recv_buffer);
-                    fflush(logfile);
-                }
-                handle_request(recv_buffer, send_buffer, BUFFER_SIZE);
-                if (logfile) {
-                    fprintf(logfile, "=== RESPONSE ready ===\n");
-                    fprintf(logfile, "RAW: %.200s...\n", send_buffer);
-                    fflush(logfile);
-                }
-                send_message(send_buffer);
-                if (logfile) {
-                    fprintf(logfile, "=== RESPONSE sent ===\n");
-                    fflush(logfile);
-                }
-            } else if (logfile && type[0] != '\0') {
-                fprintf(logfile, "=== UNKNOWN type: '%s' ===\n", type);
-                fprintf(logfile, "RAW: %.200s...\n", recv_buffer);
-                fflush(logfile);
-            }
+
+                consume_packet(length);
+            }  /* end while(1) packet processing loop */
         }
     }
 
+done:
     disable_raw_mode();
 }
 
@@ -1718,34 +2388,40 @@ static void main_loop(void) {
  * Main
  * ============================================================================ */
 
-int main(int argc, char *argv[]) {
-    const char *host;
-    int port;
+int main(argc, argv)
+int argc;
+char *argv[];
+{
+    char *host = NULL;
+    int port = 0;
     int i;
 
-    /* Parse options */
+    /* Initialize stream table */
+    for (i = 0; i < MAX_STREAMS; i++) {
+        streams[i].state = STREAM_STATE_IDLE;
+    }
+
+    /* Parse arguments */
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--simple") == 0) {
             simple_mode = 1;
         } else if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--resume") == 0) {
             resume_mode = 1;
         } else if (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "--log") == 0) {
-            logfile = fopen("/tmp/telepresence.log", "w");
+            /* Try current directory first, then /tmp */
+            logfile = fopen("telepresence-v2.log", "w");
             if (logfile) {
-                fprintf(stderr, "*** Logging enabled: /tmp/telepresence.log ***\n");
-                fprintf(logfile, "=== Log started ===\n");
-                fflush(logfile);
+                fprintf(stderr, "Logging to telepresence-v2.log\n");
             } else {
-                fprintf(stderr, "*** Failed to open log file! ***\n");
+                logfile = fopen("/tmp/telepresence-v2.log", "w");
+                if (logfile) {
+                    fprintf(stderr, "Logging to /tmp/telepresence-v2.log\n");
+                } else {
+                    fprintf(stderr, "Warning: Could not open log file: %s\n",
+                            strerror(errno));
+                }
             }
-        }
-    }
-
-    /* Find host and port (non-flag arguments) */
-    host = NULL;
-    port = 0;
-    for (i = 1; i < argc; i++) {
-        if (argv[i][0] != '-') {
+        } else if (argv[i][0] != '-') {
             if (!host) {
                 host = argv[i];
             } else if (!port) {
@@ -1756,79 +2432,45 @@ int main(int argc, char *argv[]) {
 
     if (!host || !port) {
         fprintf(stderr, "Usage: %s [-s] [-r] [-l] <host> <port>\n", argv[0]);
-        fprintf(stderr, "Connect to claude-telepresence relay server\n");
         fprintf(stderr, "\nOptions:\n");
-        fprintf(stderr, "  -s, --simple   Simple mode: convert Unicode to ASCII\n");
-        fprintf(stderr, "  -r, --resume   Resume previous conversation\n");
-        fprintf(stderr, "  -l, --log      Log to /tmp/telepresence.log\n");
+        fprintf(stderr, "  -s, --simple   Simple mode (ASCII terminal)\n");
+        fprintf(stderr, "  -r, --resume   Resume previous session\n");
+        fprintf(stderr, "  -l, --log      Enable debug logging\n");
         return 1;
     }
 
-    /* Allocate buffers */
-    recv_buffer = malloc(BUFFER_SIZE);
-    send_buffer = malloc(BUFFER_SIZE);
-    json_buffer = malloc(BUFFER_SIZE);
-    result_buffer = malloc(BUFFER_SIZE);
-
-    if (!recv_buffer || !send_buffer || !json_buffer || !result_buffer) {
-        fprintf(stderr, "Failed to allocate buffers\n");
+    /* Allocate receive buffer */
+    recv_buf_cap = 8192;
+    recv_buf = malloc(recv_buf_cap);
+    if (!recv_buf) {
+        fprintf(stderr, "Out of memory\n");
         return 1;
     }
 
-    fprintf(stderr, "Connecting to %s:%d (simple=%d, log=%s)...\n",
-            host, port, simple_mode, logfile ? "yes" : "no");
+    fprintf(stderr, "Connecting to %s:%d...\n", host, port);
 
     if (connect_to_relay(host, port) < 0) {
         return 1;
     }
 
-    /* Send hello with cwd so relay knows our working directory */
-    {
-        char cwd[MAX_PATH];
-        char escaped_cwd[MAX_PATH * 2];
-        char *p, *q;
+    fprintf(stderr, "Connected, sending HELLO...\n");
 
-#ifdef NEXT_COMPAT
-        /* NeXT uses getwd() instead of getcwd() */
-        if (getwd(cwd) == NULL) {
-            strcpy(cwd, "/");
-        }
-#else
-        if (getcwd(cwd, sizeof(cwd)) == NULL) {
-            strcpy(cwd, "/");
-        }
-#endif
-
-        /* Escape cwd for JSON */
-        p = cwd;
-        q = escaped_cwd;
-        while (*p && q < escaped_cwd + sizeof(escaped_cwd) - 2) {
-            if (*p == '"' || *p == '\\') {
-                *q++ = '\\';
-            }
-            *q++ = *p++;
-        }
-        *q = '\0';
-
-        if (resume_mode) {
-            snprintf(send_buffer, BUFFER_SIZE,
-                     "{\"type\":\"hello\",\"cwd\":\"%s\",\"resume\":true}", escaped_cwd);
-        } else {
-            snprintf(send_buffer, BUFFER_SIZE,
-                     "{\"type\":\"hello\",\"cwd\":\"%s\"}", escaped_cwd);
-        }
-        send_message(send_buffer);
+    if (send_hello() < 0) {
+        fprintf(stderr, "Failed to send HELLO\n");
+        return 1;
     }
 
-    fprintf(stderr, "Connected! Starting Claude Code session...\n\n");
+    if (wait_for_hello_ack() < 0) {
+        return 1;
+    }
+
+    fprintf(stderr, "Session established.\n\n");
 
     main_loop();
 
     if (sockfd >= 0) close(sockfd);
-    free(recv_buffer);
-    free(send_buffer);
-    free(json_buffer);
-    free(result_buffer);
+    if (recv_buf) free(recv_buf);
+    if (logfile) fclose(logfile);
 
     return 0;
 }

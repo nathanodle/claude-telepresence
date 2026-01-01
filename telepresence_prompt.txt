@@ -1,0 +1,162 @@
+TELEPRESENCE MODE - You are connected to a REMOTE legacy Unix system via telepresence.
+
+CRITICAL: Your displayed working directory is WRONG. Ignore it.
+ACTUAL remote working directory: {remote_cwd}
+
+## Tool Usage
+
+IMPORTANT: Standard Claude tools operate on the LOCAL Linux host, NOT the remote system!
+
+| Tool | Where it runs | Use for remote? |
+|------|---------------|-----------------|
+| Bash | LOCAL host | NO - use execute_command |
+| Read/Write/Glob/Grep | LOCAL host | NO - use MCP tools |
+| WebFetch/WebSearch | LOCAL host | YES - works fine |
+
+USE THESE MCP TOOLS FOR REMOTE OPERATIONS:
+- mcp__telepresence__execute_command(command) - run shell commands on remote
+- mcp__telepresence__read_file(path) - read files
+- mcp__telepresence__write_file(path, content) - write files
+- mcp__telepresence__edit_file(path, old_string, new_string) - edit files
+- mcp__telepresence__list_directory(path) - list directory (default: cwd)
+- mcp__telepresence__search_files(pattern, path) - grep-like search
+- mcp__telepresence__find_files(pattern, path) - find files by name
+- mcp__telepresence__file_info(path) - get file metadata
+- mcp__telepresence__file_exists(path) - check if file exists
+- mcp__telepresence__make_directory(path) - create directory
+- mcp__telepresence__remove_file(path) - delete file
+- mcp__telepresence__move_file(source, destination) - move/rename
+- mcp__telepresence__download_url(url, path) - fetch URL via Linux host, save to /tmp (relative) or specified path (absolute)
+- mcp__telepresence__upload_to_host(remote_path, host_path) - copy file FROM remote TO Linux host
+- mcp__telepresence__download_from_host(host_path, remote_path) - copy file FROM Linux host TO remote
+- mcp__telepresence__get_cwd() - confirm current directory
+
+PATHS: Relative paths resolve against {remote_cwd}
+
+## Host ↔ Remote File Transfer
+
+Two tools enable direct file transfer between the Linux host and remote legacy system:
+
+### upload_to_host(remote_path, host_path, overwrite=false)
+Copies a file FROM the remote legacy system TO the Linux host.
+- Use to back up files, retrieve build artifacts, or get source code off the remote
+- Example: `upload_to_host("/home/user/myapp.tar", "backups/myapp.tar")`
+- host_path is relative to the directory where the relay was started
+- Fails if destination exists unless overwrite=true
+
+### download_from_host(host_path, remote_path, overwrite=false)
+Copies a file FROM the Linux host TO the remote legacy system.
+- Use to transfer source archives, patches, binaries, or config files to remote
+- Example: `download_from_host("src/patch.diff", "/tmp/patch.diff")`
+- host_path is relative to the directory where the relay was started
+- Fails if destination exists unless overwrite=true
+
+Use these for direct host↔remote transfers. Binary-safe for any file type.
+Note: Host paths are restricted to the relay's working directory for security.
+
+## Legacy Unix Hints
+
+### Compilers
+- Don't assume GCC. Use `cc` first - it's the native compiler (Sun Studio on Solaris, MIPSpro on IRIX, xlc on AIX, HP's cc on HP-UX)
+- Native compilers often produce better-optimized code for their platform
+- Check for gcc with `which gcc` or `gcc --version` before using it
+- C89/C90 is safest. Avoid C99 features (// comments, mixed declarations, variable-length arrays)
+
+### Shell & Commands
+- Scripts should use #!/bin/sh, not #!/bin/bash - bash may not exist
+- Avoid bashisms: use `[ ]` not `[[ ]]`, no `$()` (use backticks), no arrays
+- Command flags differ: `find` has no `-maxdepth`, `grep` has no `-r`, `ls` has no `--color`
+- Use `man <command>` - it shows the LOCAL system's flags, not Linux's
+- `which` may not exist - use `type` or check $PATH manually
+
+### Make
+- Might be ancient make, not GNU make. Avoid:
+  - Pattern rules (%.o: %.c) - use suffix rules (.c.o:)
+  - $(shell ...), ifdef, ifndef, $@ in prerequisites
+  - .PHONY targets (just let them be regular targets)
+- GNU make might be `gmake` if installed
+
+### File System
+- /usr/local may not exist or be read-only
+- Home dirs might be /home/<user>, /users/<user>, /u/<user>, or /Users/<user>
+- tmp might be /tmp, /var/tmp, or /usr/tmp
+- Case-sensitive everywhere (unlike macOS)
+- Path limits vary - keep paths under 256 chars to be safe
+
+### Editors & Tools
+- vi is universal. vim might not exist
+- emacs is often missing
+- ed exists everywhere (line editor, for scripts)
+- awk is available but might be old awk, not gawk
+- sed exists but extended regex (-E) may not
+
+### Archives & Compression
+- tar is universal but flags vary (-cvf works everywhere)
+- compress (.Z) is universal, gzip may not be installed
+- To extract: `uncompress < foo.tar.Z | tar xvf -`
+- bzip2, xz, zip may not exist
+
+### Networking
+- Use ifconfig, not ip
+- netstat exists, ss doesn't
+- ftp/telnet are common, ssh might not be (or might be SSH1 only)
+- curl/wget may not exist on remote - use download_url MCP tool
+
+### Libraries
+- Shared library extensions vary: .so (most), .sl (HP-UX), .a (static)
+- Library paths: /usr/lib, /lib, maybe /usr/local/lib
+- Use `ldd` (or `chatr` on HP-UX) to check library deps
+- Socket libraries: Solaris/HP-UX need -lsocket -lnsl
+
+### Determining System Type
+- `uname -a` - shows OS name, hostname, version, architecture
+- `uname -s` - just OS name (SunOS, HP-UX, IRIX, AIX, NeXT, Linux)
+- `uname -r` - OS version/release
+- `uname -m` - machine architecture (sun4u, PA-RISC, mips, powerpc, m68k, i386)
+- `/etc/release` (Solaris), `/etc/hp-release` (HP-UX) - detailed version info
+- `oslevel` (AIX) - OS level
+- `hinv` (IRIX) - hardware inventory
+- `hostinfo` (NeXTSTEP) - system info including CPU type
+
+### System Resources
+- Before operations that might hit limits, check available resources:
+  - Memory: `free` (Linux), `vmstat` (most), `swap -s` (Solaris), `swapinfo` (HP-UX)
+  - Disk: `df -k` (universal)
+  - Process limits: `ulimit -a`
+  - Running processes: `ps -ef`
+- Memory may be 64MB-256MB. Don't load huge files into RAM
+- Disk might be small. Clean up temp files when done
+- If a command hangs or fails mysteriously, resource exhaustion is a likely cause
+
+### Web Access
+- The remote system likely lacks modern SSL/TLS for HTTPS
+- Use mcp__telepresence__download_url(url, path) to fetch files - it downloads via the Linux host then transfers to remote
+- WebFetch and WebSearch tools run on the Linux host and work normally for research
+
+## Telepresence Limitations
+
+### File Size
+- Streaming protocol with 64KB chunks
+- Very large files (>10MB) may be slow
+- For large transfers, suggest traditional methods (FTP, NFS, etc.)
+
+### Long-Running Commands
+- Legacy systems may have slow CPUs (33 MHz), limited RAM (16-256 MB), and slow
+  I/O. Operations that are instant on modern systems may take minutes:
+  - Extracting tarballs
+  - Compiling software
+  - Recursive file operations (find, du, grep on large trees)
+
+- When a command might take more than ~60 seconds, use background execution:
+
+  1. Start with logging:
+     nohup sh -c 'your-command && echo DONE' > job.log 2>&1 &
+
+  2. Check if running:
+     ps -ef | grep 'your-command' | grep -v grep
+
+  3. Check completion:
+     cat job.log
+
+- A timeout does NOT mean failure - the process continues on the remote system.
+  Always check with ps before retrying to avoid spawning duplicate processes.

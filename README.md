@@ -49,19 +49,14 @@ Legacy Unix systems can't run modern software, but they're still useful for deve
 git clone https://github.com/nathanodle/claude-telepresence.git
 cd claude-telepresence
 
-# Build the helper binary (used for proxying bash commands)
-make telepresence-helper
-
 # Start the relay (listens on port 5000 by default)
 python3 relay.py --port 5000
 ```
 
-The relay will automatically:
-- Copy `telepresence-helper` from the repo directory to `/tmp/telepresence-helper`
+The relay will:
 - Start an MCP server on port 5001
 - Wait for a client connection on port 5000
-
-**Note:** The helper must be built before starting the relay. It's used by Claude's hooks to proxy shell commands to the legacy system.
+- Spawn Claude Code when a client connects
 
 ### 2. Setup Legacy Client
 
@@ -73,8 +68,6 @@ cc -o claude-telepresence client.c
 
 # HP-UX with ANSI C compiler
 cc -Aa -o claude-telepresence client.c
-# or with bundled K&R compiler (see below)
-cc -o claude-telepresence client_kr.c
 
 # Solaris
 cc -o claude-telepresence client.c -lsocket -lnsl
@@ -88,22 +81,6 @@ cc -o claude-telepresence client.c
 # Linux (for testing)
 gcc -o claude-telepresence client.c
 ```
-
-#### HP-UX with Bundled (K&R) Compiler
-
-Older HP-UX systems may only have the bundled K&R C compiler, which doesn't support ANSI C89 features like function prototypes. If you see errors like:
-
-```
-(Bundled) cc: "client.c", line 130: error 1705: Function prototypes are an ANSI feature.
-```
-
-Use the K&R-compatible version instead:
-
-```bash
-cc -o claude-telepresence client_kr.c
-```
-
-This version has all the same functionality but uses pre-ANSI K&R C syntax. No additional libraries are needed on HP-UX.
 
 ### 3. Connect
 
@@ -138,9 +115,11 @@ Example with all options:
 
 2. **File Operations**: When Claude needs to read/write files, it uses MCP tools that send requests to the client. The client performs the actual file operations locally on the legacy system.
 
-3. **Shell Commands**: Claude's bash commands are intercepted by a hook, proxied through a helper binary, and executed on the legacy system via the client.
+3. **Shell Commands**: When Claude runs shell commands, the relay sends them to the client via MCP. The client executes commands locally and streams output back.
 
 4. **Web Access**: Since legacy systems can't do modern HTTPS, the `download_url` tool fetches files on the Linux host and transfers them to the legacy system.
+
+5. **Host ↔ Remote Transfer**: Files can be transferred directly between the Linux host and legacy system using `upload_to_host` and `download_from_host` tools.
 
 ## Features
 
@@ -150,6 +129,7 @@ Example with all options:
 - Unicode to ASCII conversion for old terminals (`-s` flag)
 - Animated spinner (`-\|/`), arrows, checkmarks in ASCII
 - Web downloads via Linux host (bypasses legacy SSL/TLS limitations)
+- Direct file transfer between Linux host and remote system
 
 ## MCP Tools
 
@@ -164,7 +144,9 @@ The relay provides these tools to Claude (used automatically):
 | `find_files` | Find files by name pattern |
 | `search_files` | Search file contents |
 | `execute_command` | Run shell command |
-| `download_url` | Download URL via Linux, save to remote |
+| `download_url` | Download URL via Linux, save to /tmp on remote |
+| `upload_to_host` | Copy file from remote to Linux host |
+| `download_from_host` | Copy file from Linux host to remote |
 | `get_cwd` | Get current directory |
 | `file_info` | Get file metadata |
 | `file_exists` | Check if path exists |
@@ -177,7 +159,7 @@ The relay provides these tools to Claude (used automatically):
 **Client won't compile:**
 - Check you have a C compiler: `which cc` or `which gcc`
 - On Solaris, ensure you're linking socket libs: `-lsocket -lnsl`
-- On HP-UX with K&R compiler errors, use `client_kr.c` instead (see above)
+- On HP-UX, use the ANSI compiler flag: `cc -Aa`
 
 **Can't connect:**
 - Verify the relay is running on Linux
@@ -192,15 +174,13 @@ The relay provides these tools to Claude (used automatically):
 - Set TERM before running curses-based programs: `export TERM=vt100`
 - On HP-UX you can also try: `export TERM=hp`
 
-**Commands not working:**
-- The relay auto-copies the helper to `/tmp/telepresence-helper`
-- Check that `/tmp` is writable on the Linux host
-
 ## Known Limitations
 
 **Command timeouts:** Long-running commands may timeout before completion. The relay and client have built-in timeouts that aren't currently configurable. For very long operations, consider breaking them into smaller steps or running them in the background with output redirected to a file. *Configurable timeouts coming in a future release.*
 
 **File transfer size limits:** The `download_url` tool and file operations use fixed-size buffers (currently ~7-10MB). Very large file downloads or transfers may fail or be truncated. For large files, consider using traditional transfer methods (FTP, NFS, etc.) instead of the telepresence file operations. *Improved buffer handling coming in a future release.*
+
+**download_url security:** The `download_url` tool fetches URLs from the relay host without URL validation. Do not run the relay on hosts with access to sensitive internal networks or cloud metadata endpoints (169.254.169.254). The tool also has no download size limit and loads responses fully into memory. *URL validation and size limits coming in a future release.*
 
 ## Documentation
 

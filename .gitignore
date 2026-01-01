@@ -1,6 +1,5 @@
 # Compiled binaries
 claude-telepresence
-telepresence-helper
 *.o
 *.so
 
@@ -15,6 +14,20 @@ venv/
 *.log
 /tmp/
 
+# Downloaded archives (don't commit tarballs)
+*.tar.gz
+*.tar.bz2
+*.tbz
+*.tgz
+*.zip
+
+# Images (test artifacts)
+*.tiff
+*.png
+*.jpg
+*.jpeg
+*.gif
+
 # Claude local settings
 .claude/
 
@@ -27,3 +40,6 @@ venv/
 
 # OS
 .DS_Store
+
+# Private security notes
+vulns.md
