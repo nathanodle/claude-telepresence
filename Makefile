@@ -3,6 +3,9 @@
 CC ?= gcc
 CFLAGS ?= -Wall -O2
 
+# Cross-compiler for Windows (install with: apt install mingw-w64)
+MINGW32 ?= i686-w64-mingw32-gcc
+
 # Detect platform for socket libs
 UNAME := $(shell uname -s)
 ifeq ($(UNAME),SunOS)
@@ -12,7 +15,7 @@ ifeq ($(UNAME),HP-UX)
     LDFLAGS += -lsocket -lnsl
 endif
 
-.PHONY: all clean test
+.PHONY: all clean test windows
 
 all: claude-telepresence telepresence-helper
 
@@ -23,7 +26,13 @@ telepresence-helper: helper.c
 	$(CC) $(CFLAGS) -o $@ $<
 
 clean:
-	rm -f claude-telepresence telepresence-helper
+	rm -f claude-telepresence telepresence-helper claude-telepresence.exe
+
+# Windows cross-compile (requires mingw-w64)
+windows: claude-telepresence.exe
+
+claude-telepresence.exe: client_winxp.c
+	$(MINGW32) $(CFLAGS) -o $@ $< -lws2_32
 
 # Copy helper to expected location for relay
 install-helper: telepresence-helper
