@@ -147,6 +147,7 @@ The relay provides these tools to Claude (used automatically):
 | `download_url` | Download URL via Linux, save to /tmp on remote |
 | `upload_to_host` | Copy file from remote to Linux host |
 | `download_from_host` | Copy file from Linux host to remote |
+| `list_host_directory` | List files on Linux host |
 | `get_cwd` | Get current directory |
 | `file_info` | Get file metadata |
 | `file_exists` | Check if path exists |

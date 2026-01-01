@@ -95,6 +95,7 @@ Model Context Protocol server providing tools to Claude:
 | `download_url` | Fetch URL via Linux, save to remote /tmp |
 | `upload_to_host` | Copy file from remote to Linux host |
 | `download_from_host` | Copy file from Linux host to remote |
+| `list_host_directory` | List files on Linux host |
 
 ## Data Flow
 

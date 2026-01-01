@@ -287,6 +287,17 @@ MCP_TOOLS = [
             },
             "required": ["host_path", "remote_path"]
         }
+    },
+    {
+        "name": "list_host_directory",
+        "description": "List contents of a directory on the Linux host. Use this to see what files are available to transfer to the remote system.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Directory path on Linux host (default: relay start directory)"}
+            },
+            "required": []
+        }
     }
 ]
 
@@ -913,6 +924,7 @@ Standard Bash/Read/Write tools operate on LOCAL host only."""
                 'download_url': self.tool_download_url,
                 'upload_to_host': self.tool_upload_to_host,
                 'download_from_host': self.tool_download_from_host,
+                'list_host_directory': self.tool_list_host_directory,
             }
 
             handler = handlers.get(tool_name)
@@ -1506,6 +1518,54 @@ Standard Bash/Read/Write tools operate on LOCAL host only."""
             raise Exception(f"Failed to write remote file: {remote_path}")
 
         return self.tool_success(f"Downloaded {len(content)} bytes\nFrom host: {host_path}\nTo remote: {remote_path}")
+
+    # -------------------------------------------------------------------------
+    # Tool: list_host_directory
+    # -------------------------------------------------------------------------
+
+    async def tool_list_host_directory(self, args: dict) -> dict:
+        """List contents of a directory on the Linux host."""
+        path_arg = args.get('path', '')
+
+        # Default to host base directory if no path specified
+        if not path_arg:
+            host_path = self.host_base_dir
+        else:
+            host_path = self.resolve_host_path(path_arg)
+
+        # Verify it's a directory
+        if not os.path.isdir(host_path):
+            raise Exception(f"Not a directory: {host_path}")
+
+        # List contents
+        entries = []
+        try:
+            for name in sorted(os.listdir(host_path)):
+                full_path = os.path.join(host_path, name)
+                try:
+                    stat = os.stat(full_path)
+                    is_dir = os.path.isdir(full_path)
+                    size = stat.st_size if not is_dir else 0
+                    entries.append({
+                        'name': name,
+                        'type': 'directory' if is_dir else 'file',
+                        'size': size
+                    })
+                except OSError:
+                    # Skip entries we can't stat
+                    entries.append({'name': name, 'type': 'unknown', 'size': 0})
+        except OSError as e:
+            raise Exception(f"Failed to list directory: {e}")
+
+        # Format output
+        lines = [f"Directory: {host_path}", ""]
+        for entry in entries:
+            if entry['type'] == 'directory':
+                lines.append(f"  {entry['name']}/")
+            else:
+                lines.append(f"  {entry['name']}  ({entry['size']} bytes)")
+
+        return self.tool_success('\n'.join(lines))
 
     # =========================================================================
     # Cleanup

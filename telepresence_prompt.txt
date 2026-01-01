@@ -29,6 +29,7 @@ USE THESE MCP TOOLS FOR REMOTE OPERATIONS:
 - mcp__telepresence__download_url(url, path) - fetch URL via Linux host, save to /tmp (relative) or specified path (absolute)
 - mcp__telepresence__upload_to_host(remote_path, host_path) - copy file FROM remote TO Linux host
 - mcp__telepresence__download_from_host(host_path, remote_path) - copy file FROM Linux host TO remote
+- mcp__telepresence__list_host_directory(path) - list files on Linux host (default: relay start dir)
 - mcp__telepresence__get_cwd() - confirm current directory
 
 PATHS: Relative paths resolve against {remote_cwd}
