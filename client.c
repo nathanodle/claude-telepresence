@@ -1,15 +1,14 @@
 /*
- * claude-telepresence client v2
+ * claude-telepresence client
  *
  * Binary streaming protocol client for legacy Unix systems.
  * Written in K&R C for maximum portability.
  *
  * Build:
- *   HP-UX (K&R):  cc -o claude-telepresence client_v2.c
- *   HP-UX (ANSI): cc -Aa -o claude-telepresence client_v2.c
- *   Solaris:      cc -o claude-telepresence client_v2.c -lsocket -lnsl
- *   IRIX/AIX:     cc -o claude-telepresence client_v2.c
- *   Linux:        gcc -o claude-telepresence client_v2.c
+ *   HP-UX:    cc -o claude-telepresence client.c
+ *   Solaris:  cc -o claude-telepresence client.c -lsocket -lnsl
+ *   IRIX/AIX: cc -o claude-telepresence client.c
+ *   Linux:    gcc -o claude-telepresence client.c
  */
 
 #include <stdio.h>

@@ -54,7 +54,7 @@ The relay is the orchestrator running on Linux. It:
 
 ### 2. Client (`client.c`)
 
-Portable C89 client for legacy Unix systems. It:
+Portable K&R C client for legacy Unix systems. It:
 
 - **Connects to relay** via TCP
 - **Sends HELLO packet** with protocol version and working directory
@@ -153,8 +153,8 @@ Large file transfers use window-based flow control to prevent buffer overflow on
 # NeXTSTEP
 cc -o claude-telepresence client.c
 
-# HP-UX with ANSI compiler
-cc -Aa -o claude-telepresence client.c
+# HP-UX
+cc -o claude-telepresence client.c
 
 # Solaris
 cc -o claude-telepresence client.c -lsocket -lnsl
@@ -175,7 +175,7 @@ python3 relay.py --port 5000
 ```
 claude-telepresence/
 ├── relay.py                 # Main relay + MCP server
-├── client.c                 # Portable C89 client
+├── client.c                 # Portable K&R C client
 ├── telepresence_prompt.txt  # System prompt for Claude
 ├── ARCHITECTURE.md          # This file
 ├── PROTOCOL.md              # Binary protocol specification

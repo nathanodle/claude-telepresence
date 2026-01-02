@@ -66,8 +66,8 @@ Transfer `client.c` to your legacy system (via FTP, NFS, or however you move fil
 # NeXTSTEP
 cc -o claude-telepresence client.c
 
-# HP-UX with ANSI C compiler
-cc -Aa -o claude-telepresence client.c
+# HP-UX
+cc -o claude-telepresence client.c
 
 # Solaris
 cc -o claude-telepresence client.c -lsocket -lnsl
@@ -160,7 +160,7 @@ The relay provides these tools to Claude (used automatically):
 **Client won't compile:**
 - Check you have a C compiler: `which cc` or `which gcc`
 - On Solaris, ensure you're linking socket libs: `-lsocket -lnsl`
-- On HP-UX, use the ANSI compiler flag: `cc -Aa`
+- On HP-UX, the bundled K&R compiler works fine
 
 **Can't connect:**
 - Verify the relay is running on Linux
