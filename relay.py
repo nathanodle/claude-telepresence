@@ -19,6 +19,9 @@ import sys
 import fcntl
 import termios
 import secrets
+import collections
+import re
+import time
 from typing import Optional, Dict, Any, List, Tuple
 
 # =============================================================================
@@ -351,6 +354,12 @@ class RelayV2:
         self.bytes_received_unacked: int = 0    # Bytes received from client, not yet acked
         self.resume_session: bool = False
         self.simple_mode: bool = False
+        self.recent_lines: collections.deque = collections.deque(maxlen=40)
+        self.strip_state: str = 'normal'
+        self.line_pending: bytes = b''
+        self.pending_commit: Optional[bytes] = None
+        self.pending_commit_time: float = 0.0
+        self.startup_prelude: bytes = b''
 
         # Stream management (relay uses even IDs)
         self.next_stream_id: int = 0
@@ -542,7 +551,20 @@ class RelayV2:
         master_fd, slave_fd = pty.openpty()
 
         env = os.environ.copy()
-        env['TERM'] = 'xterm-256color'
+        if self.simple_mode:
+            # A dumb console (e.g. Win98's native Win32 console, which has
+            # no ANSI.SYS support for Win32 apps) can only render a linear
+            # scrolling stream - it cannot honor cursor-addressed redraws.
+            # Claiming xterm-256color here would make Claude's Ink-based UI
+            # do full-screen differential redraws, which get flattened into
+            # unreadable interleaved noise once escape codes are stripped
+            # client-side. Ask Claude to render plainly instead, at the
+            # source, rather than trying to reconstruct a screen from
+            # discarded cursor-positioning codes on the client.
+            env['TERM'] = 'dumb'
+            env['NO_COLOR'] = '1'
+        else:
+            env['TERM'] = 'xterm-256color'
 
         # Write MCP config
         mcp_config = {
@@ -559,10 +581,27 @@ class RelayV2:
 
         system_prompt = self.build_system_prompt()
 
+        telepresence_tools = ','.join(f"mcp__telepresence__{t['name']}" for t in MCP_TOOLS)
+        # --dangerously-skip-permissions is not optional here, not a
+        # convenience: the interactive "Allow this tool?" confirmation it
+        # would otherwise show is itself rendered through the same
+        # --ax-screen-reader redraw path a dumb console (e.g. Win98's)
+        # can't reliably display or answer - a stuck confirmation just
+        # looks identical to a hung command, with no way to unstick it.
+        # See README_WINDOWS.md for the full explanation and the
+        # trusted-network assumption this requires.
         cmd = ['claude', '--mcp-config', mcp_config_path, '--strict-mcp-config',
-               '--append-system-prompt', system_prompt]
+               '--append-system-prompt', system_prompt,
+               '--allowedTools', telepresence_tools,
+               '--dangerously-skip-permissions']
         if self.resume_session:
             cmd.insert(1, '--resume')
+        if self.simple_mode:
+            # Flat text, no decorative borders/animations/cursor-addressed
+            # redraws - built for screen readers, but exactly what a dumb
+            # linear-only console (e.g. Win98's native Win32 console) needs
+            # too, instead of trying to strip/replicate Ink's TUI redraws.
+            cmd.insert(1, '--ax-screen-reader')
 
         pid = os.fork()
         if pid == 0:
@@ -594,17 +633,69 @@ class RelayV2:
         flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
         fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
+        self.startup_prelude = self._auto_accept_bypass_warning(master_fd)
+
         print(f"  Claude PID: {pid}")
+
+    def _auto_accept_bypass_warning(self, master_fd) -> bytes:
+        """--dangerously-skip-permissions shows a one-time fixed safety
+        warning at session start ("WARNING: Claude Code running in Bypass
+        Permissions mode ... Enter y/n:") requiring an interactive y/n -
+        there's no flag/env var to suppress it outright (checked). Since
+        the flag itself was only added with explicit user sign-off to run
+        fully unattended, auto-answer this one fixed, deterministic
+        prompt here rather than making every session start require a
+        manual confirmation the user already gave in advance. Brief
+        blocking wait (this runs once, synchronously, right after fork -
+        before the main event loop's PTY consumer starts) is acceptable
+        for a sub-2s startup check.
+
+        Returns whatever raw bytes were read along the way (startup
+        banner, the warning text itself, etc.) so the caller can still
+        forward them to the client instead of silently discarding
+        output read outside the normal pty_to_client loop - important
+        if the expected text ever doesn't show up (e.g. wording changes
+        in a future Claude Code version) and this only times out.
+        """
+        import select as _select
+        buf = b''
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            r, _, _ = _select.select([master_fd], [], [], 0.1)
+            if r:
+                try:
+                    chunk = os.read(master_fd, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+                if b'Bypass Permissions mode' in buf and b'Enter y/n' in buf:
+                    os.write(master_fd, b'y\r')
+                    return buf
+            if len(buf) > 65536:
+                break
+        return buf
+
+    def is_windows_remote(self) -> bool:
+        """Windows clients report a drive-letter cwd (e.g. C:\\claude);
+        legacy Unix clients report a POSIX path. Used to pick the right
+        system prompt template and defaults - giving Unix-flavored advice
+        (cc, /etc, #!/bin/sh) to a Win9x box is actively wrong, not just
+        unhelpful."""
+        return bool(re.match(r'^[A-Za-z]:\\', self.remote_cwd or ''))
 
     def build_system_prompt(self) -> str:
         """Build telepresence system prompt from template file."""
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        prompt_file = os.path.join(script_dir, 'telepresence_prompt.txt')
+        windows = self.is_windows_remote()
+        template_name = 'telepresence_prompt_windows.txt' if windows else 'telepresence_prompt.txt'
+        prompt_file = os.path.join(script_dir, template_name)
 
         if not os.path.exists(prompt_file):
-            prompt_file = '/etc/telepresence_prompt.txt'
+            prompt_file = f'/etc/{template_name}'
         if not os.path.exists(prompt_file):
-            prompt_file = os.path.expanduser('~/.telepresence_prompt.txt')
+            prompt_file = os.path.expanduser(f'~/.{template_name}')
 
         if os.path.exists(prompt_file):
             try:
@@ -613,6 +704,14 @@ class RelayV2:
                 return template.format(remote_cwd=self.remote_cwd)
             except Exception as e:
                 print(f"Warning: Could not load prompt file: {e}")
+
+        if windows:
+            return f"""TELEPRESENCE MODE - Connected to REMOTE legacy Windows (9x/ME) system.
+Remote working directory: {self.remote_cwd}
+
+Use mcp__telepresence__* tools for all remote operations.
+Standard Bash/Read/Write tools operate on LOCAL host only.
+This is DOS/Windows 9x: COMMAND.COM shell, backslash paths, no Unix tools."""
 
         return f"""TELEPRESENCE MODE - Connected to REMOTE legacy Unix system.
 Remote working directory: {self.remote_cwd}
@@ -624,15 +723,189 @@ Standard Bash/Read/Write tools operate on LOCAL host only."""
         """Forward PTY output to client."""
         loop = asyncio.get_running_loop()
 
+        if self.startup_prelude:
+            # Bytes consumed by _auto_accept_bypass_warning() outside this
+            # loop (startup banner, the warning text itself) - forward
+            # rather than silently drop, in case its pattern match ever
+            # doesn't fire (e.g. future Claude Code wording change).
+            prelude, self.startup_prelude = self.startup_prelude, b''
+            if self.simple_mode:
+                prelude = self.dedup_lines(prelude)
+            if prelude:
+                await self.send_packet(PKT_TERM_OUTPUT, prelude)
+
         while True:
             try:
                 data = await loop.run_in_executor(None, self.read_pty)
                 if data is None:
                     break
+
+                if not self.simple_mode:
+                    if data:
+                        await self.send_packet(PKT_TERM_OUTPUT, data)
+                    continue
+
                 if data:
-                    await self.send_packet(PKT_TERM_OUTPUT, data)
+                    out = self.dedup_lines(data)
+                    if out:
+                        await self.send_packet(PKT_TERM_OUTPUT, out)
+                    continue
+
+                # No new PTY data this poll: a held commit (see
+                # _commit_line) only gets released once a genuinely
+                # different line arrives to prove it settled - on real
+                # silence (nothing left to arrive at all) force it out
+                # after a short idle period instead of holding forever.
+                if self.pending_commit is not None and loop.time() - self.pending_commit_time >= 0.3:
+                    flushed = self._emit_line(self.pending_commit)
+                    self.pending_commit = None
+                    if flushed:
+                        await self.send_packet(PKT_TERM_OUTPUT, flushed)
             except Exception:
                 break
+
+    def _emit_line(self, line: bytes) -> bytes:
+        """Dedup a single settled line against recently-sent lines."""
+        if not line:
+            return b''
+        if line in self.recent_lines:
+            return b''
+        self.recent_lines.append(line)
+        return line + b'\n'
+
+    def _commit_line(self, line: bytes) -> bytes:
+        """A line just got a genuine newline terminator - but confirmed on
+        real hardware, that alone doesn't mean it's settled: streaming
+        response text is redrawn by committing a real '\\r\\n' after each
+        intermediate chunk (not via '\\x1b[2K' erase-line, which the
+        line_pending reset already handles), then redrawing the whole
+        block again for the next chunk - "claude: Hello" / "claude: Hello!
+        I'm..." / ... each newline-terminated in turn. Hold the most
+        recent commit and keep replacing it as long as each new one is a
+        prefix-extension of the last (or vice versa, e.g. a backspace-
+        driven shrink) - only emit once something that is NOT a
+        continuation shows up, proving the held one had actually settled.
+
+        Confirmed on real hardware this isn't quite enough on its own:
+        the "same growing thing" instances are NOT adjacent in the
+        committed stream - status/tip lines (spinner, transcript notice,
+        "manual mode on", ...) reprint identically between every growth
+        step and sit between them. Each one, being unrelated content,
+        would otherwise look like "something new arrived" and flush the
+        still-growing response prematurely. Since those chrome lines are
+        exact repeats already caught by recent_lines, an already-seen
+        duplicate is treated as chrome noise and absorbed WITHOUT
+        touching whatever's currently held - only a genuinely new,
+        never-seen-before line is allowed to settle the held one.
+        """
+        if line and line in self.recent_lines:
+            return b''
+
+        out = b''
+        if (self.pending_commit is not None and line and self.pending_commit
+                and line != self.pending_commit
+                and (line.startswith(self.pending_commit) or self.pending_commit.startswith(line))):
+            self.pending_commit = line
+            self.pending_commit_time = asyncio.get_running_loop().time()
+            return out
+
+        if self.pending_commit is not None:
+            out = self._emit_line(self.pending_commit)
+
+        self.pending_commit = line
+        self.pending_commit_time = asyncio.get_running_loop().time()
+        return out
+
+    def dedup_lines(self, data: bytes) -> bytes:
+        """Turn a raw VT redraw stream into clean, de-duplicated lines.
+
+        Confirmed by direct reproduction (capturing raw --ax-screen-reader
+        output outside the Win98 round-trip): a growing line (live input
+        echo, streaming response text) is redrawn using ONLY '\\x1b[2K'
+        (erase entire line) + '\\x1b[G'/'\\x1b[nG' (cursor to column) -
+        there is no '\\r' or '\\n' anywhere during the growth, only once
+        the line finally settles. So there is no line boundary to split
+        on while it's growing; every previous attempt at this (fixed
+        timing windows, comparing lines for a prefix relationship) failed
+        because there's only ONE giant unterminated line to work with
+        until the real newline shows up.
+
+        The correct fix mirrors what a real terminal does: treat the
+        erase-line escape itself as the reset signal. Track a pending
+        "current line" buffer; erase-line truncates it back to empty
+        (discarding the previous, now-obsolete, redraw attempt) instead
+        of leaving stale content to accumulate; a real '\\r'/'\\n' commits
+        it as a finished line, which then only needs simple exact-repeat
+        dedup against recently-sent lines (recent_lines) - no more
+        prefix/growth guessing needed, since erase-line already discards
+        every intermediate redraw state before it can ever reach output.
+
+        OSC sequences (window title) and single-char escapes are still
+        just discarded outright - they carry no useful console content.
+        State persists across calls (self.strip_state, self.line_pending)
+        since sequences and redraws routinely span multiple PTY reads.
+        """
+        out = bytearray()
+        i = 0
+        n = len(data)
+        while i < n:
+            b = data[i]
+            c = bytes([b])
+
+            if self.strip_state == 'normal':
+                if c == b'\x1b':
+                    self.strip_state = 'esc'
+                elif c == b'\n':
+                    out += self._commit_line(self.line_pending)
+                    self.line_pending = b''
+                elif c == b'\r':
+                    if i + 1 < n and data[i+1:i+2] == b'\n':
+                        # Real CRLF line ending - commit, consume both.
+                        out += self._commit_line(self.line_pending)
+                        self.line_pending = b''
+                        i += 1
+                    else:
+                        # Bare \r with no \n: not a line ending here - Ink
+                        # also redraws a growing line by just returning to
+                        # column 1 and reprinting the whole (longer) text,
+                        # relying on it naturally overwriting the shorter
+                        # previous content, with no erase-line code at all.
+                        # Confirmed on real hardware: treating bare \r as a
+                        # hard commit (as \r\n would be) split a single
+                        # streaming response into multiple "final" lines
+                        # ("claude: Hello" / "claude: Hello! I'm..." /
+                        # ...). Reset like erase-line instead, so only the
+                        # eventually-settled, real-newline-terminated
+                        # version ever gets emitted.
+                        self.line_pending = b''
+                else:
+                    self.line_pending += c
+            elif self.strip_state == 'esc':
+                if c == b'[':
+                    self.strip_state = 'csi'
+                elif c == b']':
+                    self.strip_state = 'osc'
+                else:
+                    self.strip_state = 'normal'  # single-char escape, discard
+            elif self.strip_state == 'csi':
+                if 0x40 <= b <= 0x7E:
+                    if c == b'K':
+                        # Erase line (any of \x1b[K, \x1b[0K, \x1b[1K,
+                        # \x1b[2K): the redraw about to follow supersedes
+                        # whatever's pending - discard it, don't append.
+                        self.line_pending = b''
+                    self.strip_state = 'normal'
+            elif self.strip_state == 'osc':
+                if c == b'\x07':
+                    self.strip_state = 'normal'
+                elif c == b'\x1b':
+                    self.strip_state = 'osc_esc'
+            elif self.strip_state == 'osc_esc':
+                self.strip_state = 'normal' if c == b'\\' else 'osc'
+
+            i += 1
+
+        return bytes(out)
 
     def read_pty(self) -> Optional[bytes]:
         """Read from PTY (blocking, run in executor)."""
@@ -646,11 +919,33 @@ Standard Bash/Read/Write tools operate on LOCAL host only."""
             return None
 
     async def packet_dispatcher(self):
-        """Read packets from client and dispatch to handlers."""
+        """Read packets from client and dispatch to handlers.
+
+        Receiving and dispatching are in SEPARATE try/excepts on purpose.
+        A failure while receiving (connection closed, malformed framing)
+        legitimately means the connection is over. But a failure while
+        DISPATCHING one packet (e.g. a duplicate STREAM_END racing a
+        timeout and calling set_result() on an already-resolved Future,
+        which raises InvalidStateError) is a bug in handling that one
+        packet, not a dead connection - previously this whole loop had a
+        single bare `except Exception: break` around both, so ANY such
+        bug silently killed the entire dispatcher with no log output.
+        Every session that ever appeared to "freeze mid tool-call" this
+        session was, in hindsight, plausibly this: the relay looked
+        totally idle because it silently stopped reading the socket at
+        all, while the TCP connection itself stayed open and the client
+        just waited forever for a response that would never come.
+        """
         while True:
             try:
                 pkt_type, payload = await self.recv_packet()
+            except (asyncio.IncompleteReadError, ConnectionError):
+                break
+            except Exception as e:
+                print(f"Fatal error receiving packet, closing connection: {e!r}")
+                break
 
+            try:
                 if pkt_type in (PKT_STREAM_DATA, PKT_STREAM_END, PKT_STREAM_ERROR):
                     if pkt_type == PKT_STREAM_DATA:
                         await self.handle_stream_data(payload)
@@ -677,10 +972,10 @@ Standard Bash/Read/Write tools operate on LOCAL host only."""
                 elif pkt_type == PKT_GOODBYE:
                     break
 
-            except asyncio.IncompleteReadError:
-                break
-            except Exception:
-                break
+            except Exception as e:
+                # A bug handling THIS packet must not take the whole
+                # connection down with it - log and keep processing.
+                print(f"Error dispatching packet type {pkt_type:#x}: {e!r}")
 
     async def terminal_handler(self):
         """Process terminal packets from queue."""
@@ -770,8 +1065,9 @@ Standard Bash/Read/Write tools operate on LOCAL host only."""
         status = payload[4]
         extra = payload[5:]
 
-        if stream_id in self.pending_streams:
-            self.pending_streams[stream_id].set_result((status, extra))
+        future = self.pending_streams.get(stream_id)
+        if future is not None and not future.done():
+            future.set_result((status, extra))
 
     async def handle_stream_error(self, payload: bytes):
         """Handle STREAM_ERROR from client."""
@@ -781,8 +1077,9 @@ Standard Bash/Read/Write tools operate on LOCAL host only."""
         error_code = payload[4]
         message, _ = decode_string(payload, 5) if len(payload) > 5 else ("Unknown error", 0)
 
-        if stream_id in self.pending_streams:
-            self.pending_streams[stream_id].set_exception(
+        future = self.pending_streams.get(stream_id)
+        if future is not None and not future.done():
+            future.set_exception(
                 Exception(f"Stream error {error_code}: {message}")
             )
 
@@ -837,7 +1134,15 @@ Standard Bash/Read/Write tools operate on LOCAL host only."""
             pass
         finally:
             writer.close()
-            await writer.wait_closed()
+            try:
+                await writer.wait_closed()
+            except (ConnectionResetError, BrokenPipeError):
+                # Client (Claude's MCP HTTP client) closes its end as soon
+                # as it's read the full Content-Length response, often
+                # before our own graceful close completes - the response
+                # was already fully sent by this point, so this is a
+                # harmless race, not a lost request.
+                pass
 
     async def send_http_error(self, writer, status: int, message: str):
         """Send HTTP error."""
@@ -950,7 +1255,26 @@ Standard Bash/Read/Write tools operate on LOCAL host only."""
         return {"content": [{"type": "text", "text": text}], "isError": False}
 
     def resolve_path(self, path: str) -> str:
-        """Resolve path against remote cwd."""
+        """Resolve path against remote cwd.
+
+        Was unconditionally posixpath-based, recognizing only Unix-style
+        '/foo' as absolute. For a Windows remote, an absolute path like
+        'C:\\claude\\ver.txt' doesn't start with '/', so it fell through
+        to posixpath.join(remote_cwd, path) anyway - producing mangled
+        paths like 'C:\\claude/C:\\claude\\ver.txt' that plainly don't
+        exist. Confirmed on real hardware: file_exists/file_info reported
+        an existing file as missing right after list_directory (which
+        doesn't hit this path-join case for a plain relative name) showed
+        it was there.
+        """
+        if self.is_windows_remote():
+            import ntpath
+            if not path:
+                return self.remote_cwd
+            if ntpath.isabs(path) or re.match(r'^[A-Za-z]:', path):
+                return ntpath.normpath(path)
+            return ntpath.normpath(ntpath.join(self.remote_cwd, path))
+
         if not path or path.startswith('/'):
             return path or self.remote_cwd
         import posixpath
@@ -1605,6 +1929,36 @@ def main():
     args = parser.parse_args()
 
     relay = RelayV2(args.host, args.port, args.mcp_port, args.claude)
+
+    def dump_debug_state(signum, frame):
+        """SIGUSR1 -> dump live state to a file. Safe, in-process
+        introspection - unlike attaching gdb to a live process (which
+        risks leaving PyGILState in a bad state, or freezing the process
+        mid-request), this just runs as an ordinary signal handler."""
+        try:
+            with open('/tmp/relay_debug_dump.txt', 'w') as f:
+                fields = [
+                    ('pending_streams', lambda: dict(relay.pending_streams)),
+                    ('stream_data', lambda: [(k, len(v)) for k, v in relay.stream_data.items()]),
+                    ('remote_cwd', lambda: relay.remote_cwd),
+                    ('line_pending', lambda: relay.line_pending),
+                    ('claude_pid', lambda: relay.claude_pid),
+                    ('bytes_in_flight', lambda: relay.bytes_in_flight),
+                    ('bytes_received_unacked', lambda: relay.bytes_received_unacked),
+                ]
+                # Each field dumped independently - one renamed/missing
+                # attribute (this has already bitten us once) shouldn't
+                # blow up the whole dump.
+                for name, getter in fields:
+                    try:
+                        f.write(f"{name}: {getter()!r}\n")
+                    except Exception as e:
+                        f.write(f"{name}: <error: {e!r}>\n")
+        except Exception as e:
+            with open('/tmp/relay_debug_dump.txt', 'w') as f:
+                f.write(f"dump failed: {e!r}\n")
+
+    signal.signal(signal.SIGUSR1, dump_debug_state)
 
     try:
         asyncio.run(relay.start())
