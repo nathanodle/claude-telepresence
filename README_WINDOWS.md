@@ -133,6 +133,23 @@ cd claude-telepresence
 python3 relay.py --port 5000
 ```
 
+⚠️ **The relay always runs spawned Claude sessions with
+`--dangerously-skip-permissions`** (its one-time safety warning is
+auto-accepted, not shown). This is not a convenience default — it's a
+requirement for this client to work at all: the interactive "Allow this
+tool?" confirmation that would otherwise appear before every remote
+`execute_command`/file write is itself rendered through the same
+`--ax-screen-reader` redraw path a dumb console (Win98's, in particular)
+can't reliably display or answer. A stuck confirmation looks identical
+to a hung command, with no way to unstick it — so bypassing permission
+checks isn't optional here.
+
+**This removes ALL permission checks, not just for the remote Windows
+target** — including the relay's own local Bash/Read/Write tools on
+whatever machine `relay.py` runs on. Only run this relay on a fully
+trusted, isolated network. Don't expose it to anything you wouldn't
+also hand full local shell access to.
+
 ### 2. Run the Client on Windows
 
 ```cmd

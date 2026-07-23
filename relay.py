@@ -582,6 +582,14 @@ class RelayV2:
         system_prompt = self.build_system_prompt()
 
         telepresence_tools = ','.join(f"mcp__telepresence__{t['name']}" for t in MCP_TOOLS)
+        # --dangerously-skip-permissions is not optional here, not a
+        # convenience: the interactive "Allow this tool?" confirmation it
+        # would otherwise show is itself rendered through the same
+        # --ax-screen-reader redraw path a dumb console (e.g. Win98's)
+        # can't reliably display or answer - a stuck confirmation just
+        # looks identical to a hung command, with no way to unstick it.
+        # See README_WINDOWS.md for the full explanation and the
+        # trusted-network assumption this requires.
         cmd = ['claude', '--mcp-config', mcp_config_path, '--strict-mcp-config',
                '--append-system-prompt', system_prompt,
                '--allowedTools', telepresence_tools,
