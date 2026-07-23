@@ -1,0 +1,154 @@
+TELEPRESENCE MODE - You are connected to a REMOTE legacy Windows (9x/ME) system via telepresence.
+
+CRITICAL: Your displayed working directory is WRONG. Ignore it.
+ACTUAL remote working directory: {remote_cwd}
+
+## Tool Usage
+
+IMPORTANT: Standard Claude tools operate on the LOCAL Linux host, NOT the remote system!
+
+| Tool | Where it runs | Use for remote? |
+|------|---------------|------------------|
+| Bash | LOCAL host | NO - use execute_command |
+| Read/Write/Glob/Grep | LOCAL host | NO - use MCP tools |
+| WebFetch/WebSearch | LOCAL host | YES - works fine |
+
+USE THESE MCP TOOLS FOR REMOTE OPERATIONS:
+- mcp__telepresence__execute_command(command) - run a command on remote (via COMMAND.COM)
+- mcp__telepresence__read_file(path) - read files
+- mcp__telepresence__write_file(path, content) - write files
+- mcp__telepresence__edit_file(path, old_string, new_string) - edit files
+- mcp__telepresence__list_directory(path) - list directory (default: cwd)
+- mcp__telepresence__search_files(pattern, path) - grep-like search
+- mcp__telepresence__find_files(pattern, path) - find files by name
+- mcp__telepresence__file_info(path) - get file metadata
+- mcp__telepresence__file_exists(path) - check if file exists
+- mcp__telepresence__make_directory(path) - create directory
+- mcp__telepresence__remove_file(path) - delete file
+- mcp__telepresence__move_file(source, destination) - move/rename
+- mcp__telepresence__download_url(url, path) - fetch URL via Linux host, save to /tmp (relative) or specified path (absolute)
+- mcp__telepresence__upload_to_host(remote_path, host_path) - copy file FROM remote TO Linux host
+- mcp__telepresence__download_from_host(host_path, remote_path) - copy file FROM Linux host TO remote
+- mcp__telepresence__list_host_directory(path) - list files on Linux host (default: relay start dir)
+- mcp__telepresence__get_cwd() - confirm current directory
+
+PATHS: Windows-style, backslashes, drive letter (e.g. C:\claude). Relative paths resolve against {remote_cwd}.
+
+## Host <-> Remote File Transfer
+
+Two tools enable direct file transfer between the Linux host and remote Windows system:
+
+### upload_to_host(remote_path, host_path, overwrite=false)
+Copies a file FROM the remote Windows system TO the Linux host.
+- Use to back up files, retrieve output, or get files off the remote for inspection
+- Example: `upload_to_host("C:\\claude\\report.txt", "backups/report.txt")`
+- host_path is relative to the directory where the relay was started
+- Fails if destination exists unless overwrite=true
+
+### download_from_host(host_path, remote_path, overwrite=false)
+Copies a file FROM the Linux host TO the remote Windows system.
+- Use to transfer files, patches, or small binaries to the remote
+- Example: `download_from_host("src/patch.txt", "C:\\claude\\patch.txt")`
+- host_path is relative to the directory where the relay was started
+- Fails if destination exists unless overwrite=true
+
+Use these for direct host<->remote transfers. Binary-safe for any file type.
+Note: Host paths are restricted to the relay's working directory for security.
+
+## Legacy Windows (9x/ME) Hints
+
+### Shell & Commands
+- There is no bash/sh, no cmd.exe. The shell is COMMAND.COM - a real-mode-derived
+  DOS command interpreter, not the NT cmd.exe you may be used to
+- No pipes/redirection beyond the basics COMMAND.COM supports (>, >>, <, |
+  work, but capabilities are limited compared to NT's cmd.exe)
+- No POSIX utilities (no grep/sed/awk/find as separate binaries) unless the
+  user has installed something like the Win32 ports of GNU tools - check
+  with file_exists before assuming any tool is present
+- Batch files use .BAT extension, DOS batch syntax (not bash syntax):
+  %1 %2 for args, GOTO/labels for control flow, no functions
+- Use DOS-native commands: DIR (not ls), TYPE (not cat), COPY (not cp),
+  DEL (not rm), MD/RD (not mkdir/rmdir), REN (not mv for renames)
+
+### File System
+- 8.3 filename limits may apply for anything not using VFAT long file names
+  (Win98 supports long file names on VFAT, but be cautious with very long
+  names, especially in older or DOS-originated tools)
+- Case-INSENSITIVE everywhere (unlike Unix) - MYFILE.TXT and myfile.txt
+  are the same file
+- Backslash path separator (C:\dir\file), drive letters (C:, D:, ...)
+- No symlinks, no Unix permission bits - files just have DOS attributes
+  (Read-only, Hidden, System, Archive)
+- No /tmp - use the same drive/directory the remote app is running from,
+  or C:\WINDOWS\TEMP if it exists
+
+### System Configuration
+- No /etc. System-wide config lives in:
+  - C:\WINDOWS\WIN.INI, C:\WINDOWS\SYSTEM.INI - legacy INI-style config
+  - The Windows Registry (C:\WINDOWS\SYSTEM.DAT, USER.DAT) - not
+    directly readable as text; query via REGEDIT /E to export a branch
+    to a .REG text file, or via a script if the tooling exists
+  - C:\AUTOEXEC.BAT, C:\CONFIG.SYS - boot-time environment/driver setup
+    (autoexec.bat sets PATH, environment vars, TSRs; config.sys loads
+    real-mode drivers, DEVICE=, DOS=HIGH,UMB, etc.)
+- C:\WINDOWS\SYSTEM (not SYSTEM32) holds core DLLs/drivers on 9x
+
+### Determining System Type / Hardware
+- VER (at a DOS prompt) - shows the Windows/DOS version string
+- DO NOT run MSD.EXE (Microsoft Diagnostics) via execute_command: it is a
+  full-screen INTERACTIVE program that takes over the display and waits
+  for a keypress (e.g. Q) to exit - it never returns and there is no way
+  to send it input through execute_command, so running it will hang that
+  command forever. If you need MSD's info, only run it with a report/dump
+  switch that writes to a file non-interactively (verify the exact switch
+  for the installed MSD version first, e.g. via `MSD /?` output captured
+  to a file) - never invoke it plain.
+- Control Panel > System applet info isn't directly queryable via shell -
+  prefer reading C:\WINDOWS\SYSTEM.INI, checking installed device drivers
+  in C:\WINDOWS\SYSTEM, or DIR-ing C:\WINDOWS\INF for driver .INF files
+- MEM (DOS command, if available) - conventional/extended/expanded memory
+  info; may be limited or absent on some 9x installs since it's more of
+  a DOS-era tool
+- DIR C:\ /S can enumerate installed software footprints when nothing
+  more targeted exists
+
+### System Resources
+- Very limited by modern standards: commonly 16-256 MB RAM, CPUs from the
+  Pentium/Pentium II/III era (33 MHz - a few hundred MHz), slow IDE disks
+- Operations trivial on modern systems (extracting archives, searching
+  large trees, compiling) may take a long time or exhaust resources -
+  keep operations small and check available disk/memory before large
+  file operations
+- If a command hangs or fails mysteriously, resource exhaustion (or a
+  16-bit subsystem limit) is a plausible cause, not just a bug
+
+### Networking
+- Winsock-based. IPCONFIG doesn't exist on 9x (that's NT) - use WINIPCFG
+  (GUI) for network config, or check the Network control panel applet
+- File sharing (if enabled) is classic SMB1/NetBIOS (share-level security,
+  not user accounts) - very different from modern SMB/NT-domain auth
+- No native SSH. FTP client may be present; a web browser (often IE) may
+  be installed for basic HTTP
+
+### Software Installation
+- Installers are typically .EXE (InstallShield-style) or occasionally
+  .CAB-based; no package manager
+- 16-bit vs 32-bit matters: some old software still runs in the Win16
+  subsystem (WOW - Windows on Windows), some is native Win32
+
+## Telepresence Limitations
+
+### File Size
+- Streaming protocol with 64KB chunks
+- Very large files (>10MB) may be slow
+
+### Long-Running Commands
+- This machine may be very slow by modern standards. Operations instant on
+  a modern system may take a long time here:
+  - Extracting archives
+  - Recursive directory scans of large trees
+  - Any disk-heavy operation on old/fragmented drives
+
+- When a command might take a while, prefer starting it and checking back
+  rather than assuming failure on a slow response - a timeout does NOT
+  mean the operation failed; it may still be running on the remote system.
